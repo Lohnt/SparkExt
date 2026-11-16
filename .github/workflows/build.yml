@@ -1,0 +1,30 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build archive
+        run: |
+          xcodebuild -project Cheat.xcodeproj -scheme Diag -configuration Release -sdk iphoneos \
+            -archivePath build/Diag.xcarchive CODE_SIGNING_ALLOWED=NO archive
+
+      - name: Package TIPA
+        run: |
+          mkdir -p build/Payload
+          cp -R build/Diag.xcarchive/Products/Applications/Diag.app build/Payload/
+          codesign --force --sign - --entitlements sources/entitlements.plist build/Payload/Diag.app
+          cd build && zip -qr Diag.tipa Payload
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Diag.tipa
+          path: build/Diag.tipa
