@@ -1,6 +1,6 @@
 #import "MemRead.h"
 
-#include <libproc.h>
+#include "libproc.h"
 #include <mach-o/loader.h>
 #include <mach/mach_vm.h>
 #include <mach/vm_region.h>
@@ -31,7 +31,7 @@ pid_t mr_find_pid_by_name(const char *name)
 
     pid_t selfPid = getpid();
     pid_t found = 0;
-    char path[PROC_PIDPATHINFO_MAXSIZE];
+    char path[MAXPATHLEN];
 
     for (int i = 0; i < count; i++) {
         pid_t pid = pids[i];

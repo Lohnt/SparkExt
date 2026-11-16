@@ -292,7 +292,10 @@
 				ENABLE_BITCODE = NO;
 				EXECUTABLE_NAME = COPSDiag;
 				GENERATE_INFOPLIST_FILE = NO;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/sources";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/sources",
+					"$(SRCROOT)/headers",
+				);
 				INFOPLIST_FILE = Resources/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -321,7 +324,10 @@
 				ENABLE_BITCODE = NO;
 				EXECUTABLE_NAME = COPSDiag;
 				GENERATE_INFOPLIST_FILE = NO;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/sources";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/sources",
+					"$(SRCROOT)/headers",
+				);
 				INFOPLIST_FILE = Resources/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				LD_RUNPATH_SEARCH_PATHS = (
