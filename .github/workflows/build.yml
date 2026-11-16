@@ -1,30 +1,60 @@
-name: Build
-
+name: Build Diag
 on:
   push:
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build archive
+      - uses: actions/checkout@v4
+      - name: Show toolchain
         run: |
-          xcodebuild -project Cheat.xcodeproj -scheme Diag -configuration Release -sdk iphoneos \
-            -archivePath build/Diag.xcarchive CODE_SIGNING_ALLOWED=NO archive
-
-      - name: Package TIPA
+          sw_vers
+          xcodebuild -version
+          uname -m
+      - name: Build unsigned app
         run: |
-          mkdir -p build/Payload
-          cp -R build/Diag.xcarchive/Products/Applications/Diag.app build/Payload/
-          codesign --force --sign - --entitlements sources/entitlements.plist build/Payload/Diag.app
-          cd build && zip -qr Diag.tipa Payload
-
-      - name: Upload artifact
+          set -o pipefail
+          xcodebuild \
+            -project Cheat.xcodeproj \
+            -scheme Diag \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+      - name: Sign ad-hoc and package
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/Diag.app"
+          if [ ! -d "$APP" ]; then echo "App bundle missing at $APP"; exit 1; fi
+          codesign --force --sign - --entitlements sources/entitlements.plist "$APP"
+          rm -rf "$RUNNER_TEMP/Payload" "$GITHUB_WORKSPACE/Diag.tipa"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -qry "$GITHUB_WORKSPACE/Diag.tipa" Payload
+          cd "$GITHUB_WORKSPACE"
+          ls -lh Diag.tipa
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Diag.tipa
-          path: build/Diag.tipa
+          name: Diag-tipa
+          path: Diag.tipa
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
