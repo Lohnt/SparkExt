@@ -3,7 +3,8 @@
 #import "Il2Cpp.h"
 
 #import <UIKit/UIKit.h>
-#include <mach/mach_vm.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
 #include <mach/vm_region.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,41 +38,41 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
                            uint64_t *out, int maxout)
 {
     int found = 0;
-    mach_vm_address_t addr = 0x100000000ULL;
+    vm_address_t addr = 0x100000000ULL;
 
     uint8_t *chunk = (uint8_t *)malloc(SCAN_CHUNK_SIZE);
     if (!chunk)
         return 0;
 
     for (int guard = 0; guard < 1000000; guard++) {
-        mach_vm_size_t size = 0;
+        vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t objectName = MACH_PORT_NULL;
 
         memset(&info, 0, sizeof(info));
-        kern_return_t kr = mach_vm_region(task,
-                                          &addr,
-                                          &size,
-                                          VM_REGION_BASIC_INFO_64,
-                                          (vm_region_info_t)&info,
-                                          &count,
-                                          &objectName);
+        kern_return_t kr = vm_region_64(task,
+                                        &addr,
+                                        &size,
+                                        VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info,
+                                        &count,
+                                        &objectName);
         if (objectName != MACH_PORT_NULL)
             mach_port_deallocate(mach_task_self(), objectName);
         if (kr != KERN_SUCCESS)
             break;
 
         if ((info.protection & VM_PROT_READ) && size >= 8 && found < maxout) {
-            mach_vm_address_t cursor = addr;
-            mach_vm_size_t remaining = size;
+            vm_address_t cursor = addr;
+            vm_size_t remaining = size;
             int failures = 0;
 
             while (remaining >= 8 && found < maxout) {
-                mach_vm_size_t want = remaining < SCAN_CHUNK_SIZE ? remaining : SCAN_CHUNK_SIZE;
+                vm_size_t want = remaining < SCAN_CHUNK_SIZE ? remaining : SCAN_CHUNK_SIZE;
                 if (mr_read(task, cursor, chunk, want)) {
                     failures = 0;
-                    for (mach_vm_size_t off = 0; off + 8 <= want; off += 8) {
+                    for (vm_size_t off = 0; off + 8 <= want; off += 8) {
                         uint64_t value = 0;
                         memcpy(&value, chunk + off, sizeof(value));
                         if (value != k1779)
@@ -94,7 +95,7 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
             }
         }
 
-        mach_vm_address_t next = addr + size;
+        vm_address_t next = addr + size;
         if (next <= addr)
             break;
         addr = next;

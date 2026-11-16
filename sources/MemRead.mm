@@ -2,7 +2,8 @@
 
 #include "libproc.h"
 #include <mach-o/loader.h>
-#include <mach/mach_vm.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
 #include <mach/vm_region.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,13 +70,13 @@ bool mr_read(mach_port_t task, uint64_t addr, void *buf, size_t len)
     if (task == MACH_PORT_NULL || !buf || len == 0)
         return false;
 
-    mach_vm_size_t outsize = 0;
-    kern_return_t kr = mach_vm_read_overwrite(task,
-                                              (mach_vm_address_t)addr,
-                                              (mach_vm_size_t)len,
-                                              (mach_vm_address_t)buf,
-                                              &outsize);
-    return (kr == KERN_SUCCESS && outsize == (mach_vm_size_t)len);
+    vm_size_t outsize = 0;
+    kern_return_t kr = vm_read_overwrite(task,
+                                         (vm_address_t)addr,
+                                         (vm_size_t)len,
+                                         (vm_address_t)buf,
+                                         &outsize);
+    return (kr == KERN_SUCCESS && outsize == (vm_size_t)len);
 }
 
 bool mr_read8(mach_port_t task, uint64_t addr, uint8_t *out)
@@ -123,22 +124,22 @@ bool mr_read_cstring(mach_port_t task, uint64_t addr, char *buf, size_t maxlen)
 
 uint64_t mr_find_unityframework_base(mach_port_t task)
 {
-    mach_vm_address_t addr = 0x100000000ULL;
+    vm_address_t addr = 0x100000000ULL;
 
     for (int guard = 0; guard < 1000000; guard++) {
-        mach_vm_size_t size = 0;
+        vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t objectName = MACH_PORT_NULL;
 
         memset(&info, 0, sizeof(info));
-        kern_return_t kr = mach_vm_region(task,
-                                          &addr,
-                                          &size,
-                                          VM_REGION_BASIC_INFO_64,
-                                          (vm_region_info_t)&info,
-                                          &count,
-                                          &objectName);
+        kern_return_t kr = vm_region_64(task,
+                                        &addr,
+                                        &size,
+                                        VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info,
+                                        &count,
+                                        &objectName);
         if (objectName != MACH_PORT_NULL)
             mach_port_deallocate(mach_task_self(), objectName);
         if (kr != KERN_SUCCESS)
@@ -174,7 +175,7 @@ uint64_t mr_find_unityframework_base(mach_port_t task)
             }
         }
 
-        mach_vm_address_t next = addr + size;
+        vm_address_t next = addr + size;
         if (next <= addr)
             break;
         addr = next;
