@@ -2,6 +2,7 @@
 #import "OverlayWindow.h"
 #import "DiagViewController.h"
 #import "SBSAccessibilityWindowHostingController.h"
+#import "DiagLog.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -12,7 +13,16 @@
 
 @implementation AppDelegate
 
+/* Runs at image load time, before main(): proves dyld resolved us and ObjC
+   class initialisation reached this bundle. */
++ (void)load
+{
+    diag_log("diag: +load");
+}
+
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
+    diag_log("diag: didFinishLaunching");
+
     DiagViewController *vc = [DiagViewController new];
     _window = [[OverlayWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     _window.rootViewController = vc;

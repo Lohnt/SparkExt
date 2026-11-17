@@ -1,6 +1,7 @@
 #import "DiagViewController.h"
 #import "MemRead.h"
 #import "Il2Cpp.h"
+#import "DiagLog.h"
 
 #import <UIKit/UIKit.h>
 #include <atomic>
@@ -148,6 +149,7 @@ stopped:
 - (void)viewDidLoad
 {
     [super viewDidLoad];
+    diag_log("diag: viewDidLoad");
 
     _task = MACH_PORT_NULL;
     _pid = 0;
@@ -223,6 +225,8 @@ stopped:
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(_workQueue, ^{
+        diag_log("diag: worker start");
+
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf)
             return;
@@ -256,6 +260,7 @@ stopped:
 /* Worker queue: find and attach to Critical Ops, at most 30 attempts. */
 - (void)attachLoop
 {
+    diag_log("diag: attaching");
     [self logLine:@"looking for CriticalOps..."];
 
     int lastRc = 0;
@@ -303,6 +308,7 @@ stopped:
 
     il2cpp_ctx ctx;
     il2cpp_bootstrap(task, &ctx);
+    diag_log("diag: bootstrap ok");
 
     [self logLine:@"uf_base = 0x%llx", ctx.uf_base];
     if (!ctx.uf_base) {

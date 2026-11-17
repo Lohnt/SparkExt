@@ -65,6 +65,38 @@ jobs:
           rm -rf Payload
           cd "$GITHUB_WORKSPACE"
           ls -lh Diag.tipa
+      - name: Binary diagnostics
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/bindiag"
+          mkdir -p "$RUNNER_TEMP/bindiag"
+          ditto -x -k Diag.tipa "$RUNNER_TEMP/bindiag"
+          cd "$RUNNER_TEMP/bindiag"
+          BIN=Payload/Diag.app/COPSDiag
+          test -f "$BIN"
+          {
+            echo "=== lipo -info $BIN ==="
+            lipo -info "$BIN"
+            echo ""
+            echo "=== otool -L $BIN ==="
+            otool -L "$BIN"
+            echo ""
+            echo "=== otool -l $BIN | LC_VERSION_MIN / LC_BUILD_VERSION ==="
+            otool -l "$BIN" | grep -B2 -A4 -E "LC_VERSION_MIN|LC_BUILD_VERSION" || true
+            echo ""
+            echo "=== file $BIN ==="
+            file "$BIN"
+            echo ""
+            echo "=== size ==="
+            ls -lh "$BIN"
+          } 2>&1 | tee "$GITHUB_WORKSPACE/binary-diagnostics.txt"
+      - name: Upload binary diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: Diag-binary-diagnostics
+          path: binary-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 30
       - name: Verify entitlements in Diag.tipa
         run: |
           set -euo pipefail
