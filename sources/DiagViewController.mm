@@ -16,9 +16,17 @@
 #define MAX_CANDIDATES 256
 #define SCAN_CHUNK_SIZE (1u << 20)
 #define NEAR_MISS_EXAMPLES 10
+#define RAW_DUMP_LIMIT 10
 
 /* Set from the main thread by the STOP button; polled by every loop. */
 static std::atomic<bool> gStopRequested(false);
+
+/* One K_1779 hit plus whether the K_7301 config link happens to hang off it.
+   config_link is reported, never used as an acceptance gate. */
+typedef struct {
+    uint64_t v;
+    uint8_t  config_link;
+} cand_t;
 
 /* Coverage counters for one scan pass. */
 typedef struct {
@@ -30,9 +38,7 @@ typedef struct {
     uint64_t regions_read_failed;
     uint64_t bytes_scanned;
     uint64_t k1779_hits;
-    uint64_t link_rejected;
-    uint64_t link_examples[NEAR_MISS_EXAMPLES];
-    int      link_example_count;
+    uint64_t config_link_hits;
     double   elapsed;
 } scan_report;
 
@@ -80,6 +86,13 @@ static bool diag_vec3_in_range(mr_vec3 v)
     return fabsf(v.x) <= limit && fabsf(v.y) <= limit && fabsf(v.z) <= limit;
 }
 
+/* Unity rotations are unit quaternions; a dead slot reads as all-zero. */
+static bool diag_quat_unit_ok(const mr_quat *q)
+{
+    float len = sqrtf(q->x * q->x + q->y * q->y + q->z * q->z + q->w * q->w);
+    return isfinite(len) && len >= 0.9f && len <= 1.1f;
+}
+
 /* Sleep in 0.25 s slices so STOP is honoured during the attach retry backoff.
    Returns true if a stop was requested while waiting. */
 static bool diag_sleep_checked(double seconds)
@@ -96,7 +109,7 @@ static bool diag_sleep_checked(double seconds)
 /* Returns the number of candidates found, or -1 if a stop was requested.
    Fills *rep with coverage statistics even on the stopped/early paths. */
 static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
-                           uint64_t *out, int maxout, scan_report *rep)
+                           cand_t *out, int maxout, scan_report *rep)
 {
     int found = 0;
     vm_address_t addr = 0;
@@ -171,15 +184,15 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
 
                         uint64_t candidate = cursor + off;
                         uint64_t link = rd64(task, candidate + 0x18);
-                        if (link != 0 && rd64(task, link) == k7301) {
-                            out[found++] = candidate;
-                            if (found >= maxout)
-                                break;
-                        } else {
-                            rep->link_rejected++;
-                            if (rep->link_example_count < NEAR_MISS_EXAMPLES)
-                                rep->link_examples[rep->link_example_count++] = candidate;
-                        }
+                        uint8_t cfg = (link != 0 && rd64(task, link) == k7301) ? 1 : 0;
+                        if (cfg)
+                            rep->config_link_hits++;
+
+                        out[found].v = candidate;
+                        out[found].config_link = cfg;
+                        found++;
+                        if (found >= maxout)
+                            break;
                     }
                 } else {
                     if (++failures >= 3) {
@@ -213,6 +226,7 @@ stopped:
     UIButton *_rerunButton;
     UIButton *_rescanButton;
     UIButton *_stopButton;
+    UIButton *_exitButton;
     BOOL _started;
     mach_port_t _task;
     pid_t _pid;
@@ -222,9 +236,11 @@ stopped:
 - (void)appendLog:(NSString *)line;
 - (void)logLine:(NSString *)fmt, ...;
 - (void)logNearMiss:(NSString *)reason bucket:(const nm_bucket *)b;
+- (void)dumpCandidateRaw:(mach_port_t)task v:(uint64_t)v index:(int)idx reason:(const char *)reason;
 - (void)reRun;
 - (void)rescan;
 - (void)stopScan;
+- (void)doExit;
 - (void)startRun;
 - (void)attachLoop;
 - (void)runDiagnostic;
@@ -251,6 +267,7 @@ stopped:
     UIFont *menlo = [UIFont fontWithName:@"Menlo" size:11.0];
     _textView.font = menlo ?: [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightRegular];
     _textView.editable = NO;
+    _textView.selectable = NO;
     _textView.textContainerInset = UIEdgeInsetsMake(50.0, 6.0, 6.0, 6.0);
     [self.view addSubview:_textView];
 
@@ -265,7 +282,8 @@ stopped:
     }
 
     /* Buttons are created AFTER the text view and pushed to the front, so they
-       always sit above the scroll view and stay pinned to the window edges. */
+       always sit above the scroll view and stay pinned to the window edges.
+       Layout right-to-left: EXIT | STOP | RESCAN. */
 
     _rerunButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_rerunButton setTitle:@"RE-RUN" forState:UIControlStateNormal];
@@ -275,10 +293,18 @@ stopped:
     [_rerunButton addTarget:self action:@selector(reRun) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_rerunButton];
 
+    _exitButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_exitButton setTitle:@"EXIT" forState:UIControlStateNormal];
+    [_exitButton setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
+    _exitButton.frame = CGRectMake(self.view.bounds.size.width - 90.0, 18.0, 80.0, 30.0);
+    _exitButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+    [_exitButton addTarget:self action:@selector(doExit) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_exitButton];
+
     _stopButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_stopButton setTitle:@"STOP" forState:UIControlStateNormal];
     [_stopButton setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
-    _stopButton.frame = CGRectMake(self.view.bounds.size.width - 90.0, 18.0, 80.0, 30.0);
+    _stopButton.frame = CGRectMake(self.view.bounds.size.width - 180.0, 18.0, 80.0, 30.0);
     _stopButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
     [_stopButton addTarget:self action:@selector(stopScan) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_stopButton];
@@ -286,7 +312,7 @@ stopped:
     _rescanButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_rescanButton setTitle:@"RESCAN" forState:UIControlStateNormal];
     [_rescanButton setTitleColor:[UIColor yellowColor] forState:UIControlStateNormal];
-    _rescanButton.frame = CGRectMake(self.view.bounds.size.width - 180.0, 18.0, 80.0, 30.0);
+    _rescanButton.frame = CGRectMake(self.view.bounds.size.width - 270.0, 18.0, 80.0, 30.0);
     _rescanButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
     [_rescanButton addTarget:self action:@selector(rescan) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_rescanButton];
@@ -294,6 +320,7 @@ stopped:
     [self.view bringSubviewToFront:_rerunButton];
     [self.view bringSubviewToFront:_rescanButton];
     [self.view bringSubviewToFront:_stopButton];
+    [self.view bringSubviewToFront:_exitButton];
 }
 
 - (void)viewDidAppear:(BOOL)animated
@@ -335,6 +362,27 @@ stopped:
     [self logLine:@"rejected: %@ = %llu", reason, b->total];
     for (int i = 0; i < b->count; i++)
         [self logLine:@"  e.g. 0x%llx", b->ex[i]];
+}
+
+/* Raw field dump for the first few rejected K_1779 hits: shows which of the
+   first nine qwords hold pointers and where those pointers land. */
+- (void)dumpCandidateRaw:(mach_port_t)task v:(uint64_t)v index:(int)idx reason:(const char *)reason
+{
+    [self logLine:@"--- reject[%d] V=0x%llx  (%s) ---", idx, v, reason];
+    [self logLine:@"  read64(V)  = 0x%llx", rd64(task, v)];
+
+    static const uint64_t offs[] = { 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40 };
+    for (int k = 0; k < 7; k++) {
+        uint64_t p = 0;
+        if (!mr_read64(task, v + offs[k], &p)) {
+            [self logLine:@"  V+0x%02llx     = <unreadable>", offs[k]];
+        } else if (p == 0) {
+            [self logLine:@"  V+0x%02llx     = 0x0", offs[k]];
+        } else {
+            [self logLine:@"  V+0x%02llx     = 0x%llx -> read64 = 0x%llx",
+                       offs[k], p, rd64(task, p)];
+        }
+    }
 }
 
 /* Main thread: cancel any in-flight work and queue a fresh run on the worker. */
@@ -390,6 +438,13 @@ stopped:
     diag_log("diag: stop pressed");
     gStopRequested.store(true);
     [self logLine:@"stop requested; scan will abort at next checkpoint"];
+}
+
+/* Guaranteed escape hatch, independent of any queue or scan state. */
+- (void)doExit
+{
+    diag_log("diag: exit pressed");
+    exit(0);
 }
 
 /* Worker queue: find and attach to Critical Ops, at most 30 attempts. */
@@ -466,8 +521,8 @@ stopped:
     [self logLine:@"verify_instance_size: %s", ctx.instance_size_ok ? "PASS" : "FAIL"];
     [self logLine:@"verify_token: %s", ctx.token_ok ? "PASS" : "FAIL"];
 
-    if (!ctx.k1779 || !ctx.k7301) {
-        [self logLine:@"FAIL: class pointers unavailable"];
+    if (!ctx.k1779) {
+        [self logLine:@"FAIL: K_1779 unavailable"];
         return;
     }
 
@@ -478,7 +533,7 @@ stopped:
 
     [self logLine:@"scanning heap..."];
 
-    uint64_t candidates[MAX_CANDIDATES];
+    cand_t candidates[MAX_CANDIDATES];
     scan_report rep;
     CFAbsoluteTime tScan = CFAbsoluteTimeGetCurrent();
     int count = scan_candidates(task, ctx.k1779, ctx.k7301, candidates, MAX_CANDIDATES, &rep);
@@ -495,8 +550,9 @@ stopped:
     [self logLine:@"  bytes scanned   = %llu (%.1f MB)", rep.bytes_scanned,
                (double)rep.bytes_scanned / (1024.0 * 1024.0)];
     [self logLine:@"  elapsed         = %.2f s (wall %.2f s)", rep.elapsed, scanWall];
-    [self logLine:@"  k1779 hits      = %llu", rep.k1779_hits];
-    [self logLine:@"  predicate passes= %d (cap %d)", count < 0 ? 0 : count, MAX_CANDIDATES];
+    [self logLine:@"  k1779 hits      = %llu (config_link hits %llu)",
+               rep.k1779_hits, rep.config_link_hits];
+    [self logLine:@"  candidates kept = %d (cap %d)", count < 0 ? 0 : count, MAX_CANDIDATES];
 
     if (count < 0) {
         diag_log("diag: scan aborted by stop");
@@ -504,11 +560,17 @@ stopped:
         return;
     }
 
-    nm_bucket nmDeref, nmZeroQuat, nmPosRange;
-    memset(&nmDeref, 0, sizeof(nmDeref));
-    memset(&nmZeroQuat, 0, sizeof(nmZeroQuat));
-    memset(&nmPosRange, 0, sizeof(nmPosRange));
+    static const char *nmNames[4] = {
+        "+0xC0 deref failed",
+        "all-zero quat (dead)",
+        "quat not unit-norm",
+        "pos out of range",
+    };
+    nm_bucket nm[4];
+    memset(nm, 0, sizeof(nm));
+
     int accepted = 0;
+    int dumped = 0;
 
     for (int i = 0; i < count; i++) {
         if (gStopRequested.load()) {
@@ -516,34 +578,66 @@ stopped:
             return;
         }
 
-        uint64_t v = candidates[i];
+        uint64_t v = candidates[i].v;
+        int nb = -1;
+        const char *reason = NULL;
 
-        /* +0xC0 must dereference to a readable quaternion. */
+        /* Quat path 1: read64(V+0xC0) -> +0x78 (pointer to a rotation).
+           Quat path 2: the 16 bytes at V+0xC0 read directly as a quat.
+           Whichever yields a unit quaternion wins; the source is reported. */
         uint64_t quatPtr = 0;
-        if (!mr_read64(task, v + 0xC0, &quatPtr) || quatPtr == 0) {
-            nm_add(&nmDeref, v);
-            continue;
-        }
-
         mr_quat quat;
         memset(&quat, 0, sizeof(quat));
-        if (!mr_read_quat(task, quatPtr + 0x78, &quat)) {
-            nm_add(&nmDeref, v);
-            continue;
+        mr_quat dq;
+        memset(&dq, 0, sizeof(dq));
+        mr_quat iq;
+        memset(&iq, 0, sizeof(iq));
+
+        const char *qsrc = "none";
+        bool derefRead = (mr_read64(task, v + 0xC0, &quatPtr) && quatPtr != 0) &&
+                         mr_read_quat(task, quatPtr + 0x78, &dq);
+        bool derefUnit = derefRead && diag_quat_unit_ok(&dq);
+
+        bool inlineRead = mr_read_quat(task, v + 0xC0, &iq);
+        bool inlineUnit = inlineRead && diag_quat_unit_ok(&iq);
+
+        if (derefUnit) {
+            quat = dq;
+            qsrc = "deref";
+        } else if (inlineUnit) {
+            quat = iq;
+            qsrc = "inline";
+        } else if (quatPtr == 0 || !derefRead) {
+            nb = 0;
+            reason = nmNames[0];
+        } else if (dq.x == 0.0f && dq.y == 0.0f && dq.z == 0.0f && dq.w == 0.0f &&
+                   iq.x == 0.0f && iq.y == 0.0f && iq.z == 0.0f && iq.w == 0.0f) {
+            nb = 1;
+            reason = nmNames[1];
+        } else {
+            nb = 2;
+            reason = nmNames[2];
         }
 
-        /* A zero quaternion means the object is destroyed but still on the heap. */
-        if (quat.x == 0.0f && quat.y == 0.0f && quat.z == 0.0f && quat.w == 0.0f) {
-            nm_add(&nmZeroQuat, v);
-            continue;
-        }
-
-        uint64_t h0 = rd64(task, v + 0x28);
-        uint64_t h1 = h0 ? rd64(task, h0 + 0x18) : 0;
+        uint64_t h0 = 0, h1 = 0;
         mr_vec3 posA;
         memset(&posA, 0, sizeof(posA));
-        if (!h1 || !mr_read_vec3(task, h1 + 0xD4, &posA) || !diag_vec3_in_range(posA)) {
-            nm_add(&nmPosRange, v);
+
+        if (!reason) {
+            h0 = rd64(task, v + 0x28);
+            h1 = h0 ? rd64(task, h0 + 0x18) : 0;
+            if (!h1 || !mr_read_vec3(task, h1 + 0xD4, &posA) || !diag_vec3_in_range(posA)) {
+                nb = 3;
+                reason = nmNames[3];
+            }
+        }
+
+        if (reason) {
+            nm_add(&nm[nb], v);
+            if (dumped < RAW_DUMP_LIMIT) {
+                dumped++;
+                [self dumpCandidateRaw:task v:v index:i reason:reason];
+            }
             continue;
         }
 
@@ -553,17 +647,17 @@ stopped:
         uint64_t b = rd64(task, v + 0x30);
         uint64_t bp = rd64(task, b + 0x40);
 
-        mr_quat q = quat;
-        float qlen = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
-        const char *qnorm = (fabsf(qlen - 1.0f) <= 0.01f) ? "PASS" : "FAIL";
+        float qlen = sqrtf(quat.x * quat.x + quat.y * quat.y +
+                           quat.z * quat.z + quat.w * quat.w);
 
         [self logLine:@"candidate[%d] ACCEPT @ 0x%llx", i, v];
         [self logLine:@"  V               = 0x%llx", v];
         [self logLine:@"  read64(V)       = 0x%llx", rd64(task, v)];
+        [self logLine:@"  config_link     = %d", (int)candidates[i].config_link];
         [self logLine:@"  read64(V+0xC0)  = 0x%llx", quatPtr];
         [self logLine:@"  quat_ptr        = 0x%llx", quatPtr];
-        [self logLine:@"  quat            = (%.4f, %.4f, %.4f, %.4f) |q|=%.4f %s",
-                   q.x, q.y, q.z, q.w, qlen, qnorm];
+        [self logLine:@"  quat            = (%.4f, %.4f, %.4f, %.4f) |q|=%.4f src=%s",
+                   quat.x, quat.y, quat.z, quat.w, qlen, qsrc];
         [self logLine:@"  pos_a hop0      = read64(V+0x28)    = 0x%llx", h0];
         [self logLine:@"  pos_a hop1      = read64(hop0+0x18) = 0x%llx", h1];
         [self logLine:@"  pos_a xyz       = @hop1+0xD4        = (%.2f, %.2f, %.2f)",
@@ -598,14 +692,10 @@ stopped:
     }
 
     [self logLine:@"--- near-misses ---"];
-    [self logLine:@"k7301 link reject  = %llu", rep.link_rejected];
-    for (int i = 0; i < rep.link_example_count; i++)
-        [self logLine:@"  e.g. 0x%llx", rep.link_examples[i]];
-    [self logNearMiss:@"+0xC0 deref failed" bucket:&nmDeref];
-    [self logNearMiss:@"all-zero quat (dead)" bucket:&nmZeroQuat];
-    [self logNearMiss:@"pos out of range" bucket:&nmPosRange];
+    for (int k = 0; k < 4; k++)
+        [self logNearMiss:[NSString stringWithUTF8String:nmNames[k]] bucket:&nm[k]];
 
-    [self logLine:@"scan complete: %d accepted / %d predicate passes", accepted, count];
+    [self logLine:@"scan complete: %d accepted / %d candidates", accepted, count];
     diag_log("diag: scan complete");
 }
 

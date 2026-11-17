@@ -122,6 +122,14 @@ jobs:
               exit 1
             fi
           done
+          echo "--- keys that must NOT be embedded ---"
+          for key in com.apple.springboard.disallowControlCenter com.apple.springboard.disallowNotificationCenter get-task-allow com.apple.private.cs.debugger; do
+            if grep -q "<key>$key</key>" "$GITHUB_WORKSPACE/entitlements-verify.txt"; then
+              echo "UNEXPECTED: $key is still embedded"
+              exit 1
+            fi
+            echo "absent: $key"
+          done
       - name: Upload entitlements dump
         uses: actions/upload-artifact@v4
         with:
