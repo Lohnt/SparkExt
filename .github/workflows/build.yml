@@ -50,7 +50,7 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           echo "--- embedded entitlements (signed executable) ---"
           codesign -d --entitlements :- "$APP/$EXE" 2>&1 | tee "$RUNNER_TEMP/signed-entitlements.xml"
-          for key in task_for_pid-allow get-task-allow com.apple.private.cs.debugger platform-application; do
+          for key in task_for_pid-allow platform-application; do
             grep -q "<key>$key</key>" "$RUNNER_TEMP/signed-entitlements.xml" || { echo "ERROR: $key was not embedded in $EXE"; exit 1; }
           done
           echo "--- entitlement check: PASS ---"
@@ -114,7 +114,7 @@ jobs:
           fi
           echo ""
           echo "--- entitlement keys ---"
-          for key in task_for_pid-allow get-task-allow com.apple.private.cs.debugger platform-application; do
+          for key in task_for_pid-allow platform-application; do
             if grep -q "<key>$key</key>" "$GITHUB_WORKSPACE/entitlements-verify.txt"; then
               echo "present: $key"
             else

@@ -167,6 +167,16 @@ stopped:
     _textView.textContainerInset = UIEdgeInsetsMake(50.0, 6.0, 6.0, 6.0);
     [self.view addSubview:_textView];
 
+    /* Show the trail from the previous process first; if it died before
+       UIApplicationMain we still see how far the run before that got. */
+    NSString *prev = gDiagPreviousRunLog;
+    if (prev.length > 0) {
+        _textView.text = [NSString stringWithFormat:@"=== previous run ===\n%@\n", prev];
+    } else {
+        _textView.text = @"=== previous run ===\n"
+                         @"(no readable log at /var/mobile/Documents/diag_boot.log)\n";
+    }
+
     _rerunButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_rerunButton setTitle:@"RE-RUN" forState:UIControlStateNormal];
     [_rerunButton setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
