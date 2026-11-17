@@ -50,16 +50,20 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           echo "--- CodeResources contents ---"
           cat "$APP/_CodeSignature/CodeResources" | head -80
-          rm -f "$GITHUB_WORKSPACE/Diag.zip"
+          rm -f "$GITHUB_WORKSPACE/Diag.tipa"
           cd "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos"
-          zip -qry "$GITHUB_WORKSPACE/Diag.zip" Diag.app
+          rm -rf Payload
+          mkdir Payload
+          cp -R Diag.app Payload/
+          zip -qry "$GITHUB_WORKSPACE/Diag.tipa" Payload
+          rm -rf Payload
           cd "$GITHUB_WORKSPACE"
-          ls -lh Diag.zip
+          ls -lh Diag.tipa
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Diag-zip
-          path: Diag.zip
+          name: Diag.tipa
+          path: Diag.tipa
           if-no-files-found: error
           retention-days: 30
       - name: Upload build log on failure
