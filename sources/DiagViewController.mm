@@ -3,6 +3,7 @@
 #import "Il2Cpp.h"
 
 #import <UIKit/UIKit.h>
+#include <atomic>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
@@ -12,6 +13,9 @@
 
 #define MAX_CANDIDATES 64
 #define SCAN_CHUNK_SIZE (1u << 20)
+
+/* Set from the main thread by the STOP button; polled by every loop. */
+static std::atomic<bool> gStopRequested(false);
 
 static uint64_t rd64(mach_port_t task, uint64_t addr)
 {
@@ -34,6 +38,7 @@ static uint8_t rd8(mach_port_t task, uint64_t addr)
     return v;
 }
 
+/* Returns the number of candidates found, or -1 if a stop was requested. */
 static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
                            uint64_t *out, int maxout)
 {
@@ -45,6 +50,9 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
         return 0;
 
     for (int guard = 0; guard < 1000000; guard++) {
+        if (gStopRequested.load())
+            goto stopped;
+
         vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
@@ -69,10 +77,16 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
             int failures = 0;
 
             while (remaining >= 8 && found < maxout) {
+                if (gStopRequested.load())
+                    goto stopped;
+
                 vm_size_t want = remaining < SCAN_CHUNK_SIZE ? remaining : SCAN_CHUNK_SIZE;
                 if (mr_read(task, cursor, chunk, want)) {
                     failures = 0;
                     for (vm_size_t off = 0; off + 8 <= want; off += 8) {
+                        if (gStopRequested.load())
+                            goto stopped;
+
                         uint64_t value = 0;
                         memcpy(&value, chunk + off, sizeof(value));
                         if (value != k1779)
@@ -103,21 +117,28 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
 
     free(chunk);
     return found;
+
+stopped:
+    free(chunk);
+    return -1;
 }
 
 @interface DiagViewController () {
     UITextView *_textView;
     UIButton *_rerunButton;
+    UIButton *_stopButton;
     BOOL _started;
     mach_port_t _task;
     pid_t _pid;
-    dispatch_queue_t _queue;
+    dispatch_queue_t _workQueue;
 }
 
 - (void)appendLog:(NSString *)line;
 - (void)logLine:(NSString *)fmt, ...;
 - (void)reRun;
-- (void)startAttach;
+- (void)stopScan;
+- (void)startRun;
+- (void)attachLoop;
 - (void)runDiagnostic;
 
 @end
@@ -129,7 +150,8 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
     [super viewDidLoad];
 
     _task = MACH_PORT_NULL;
-    _queue = dispatch_queue_create("dev.cops.diag.attach", DISPATCH_QUEUE_SERIAL);
+    _pid = 0;
+    _workQueue = dispatch_queue_create("dev.cops.diag.work", DISPATCH_QUEUE_SERIAL);
 
     self.view.backgroundColor = [UIColor blackColor];
 
@@ -150,6 +172,14 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
     _rerunButton.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
     [_rerunButton addTarget:self action:@selector(reRun) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_rerunButton];
+
+    _stopButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_stopButton setTitle:@"STOP" forState:UIControlStateNormal];
+    [_stopButton setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
+    _stopButton.frame = CGRectMake(self.view.bounds.size.width - 90.0, 18.0, 80.0, 30.0);
+    _stopButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+    [_stopButton addTarget:self action:@selector(stopScan) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_stopButton];
 }
 
 - (void)viewDidAppear:(BOOL)animated
@@ -157,7 +187,7 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
     [super viewDidAppear:animated];
     if (!_started) {
         _started = YES;
-        [self startAttach];
+        [self startRun];
     }
 }
 
@@ -186,6 +216,27 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
     [self appendLog:line];
 }
 
+/* Main thread: cancel any in-flight work and queue a fresh run on the worker. */
+- (void)startRun
+{
+    gStopRequested.store(true);
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(_workQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf)
+            return;
+
+        gStopRequested.store(false);
+
+        if (strongSelf->_task != MACH_PORT_NULL) {
+            [strongSelf runDiagnostic];
+        } else {
+            [strongSelf attachLoop];
+        }
+    });
+}
+
 - (void)reRun
 {
     if (![NSThread isMainThread]) {
@@ -194,57 +245,59 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
     }
 
     _textView.text = @"";
-    if (_task != MACH_PORT_NULL) {
-        [self runDiagnostic];
-    } else {
-        [self startAttach];
-    }
+    [self startRun];
 }
 
-- (void)startAttach
+- (void)stopScan
+{
+    gStopRequested.store(true);
+}
+
+/* Worker queue: find and attach to Critical Ops, at most 30 attempts. */
+- (void)attachLoop
 {
     [self logLine:@"looking for CriticalOps..."];
 
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(_queue, ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf)
-            return;
+    int lastRc = 0;
 
-        for (int attempt = 0; attempt < 30; attempt++) {
-            pid_t pid = mr_find_pid_by_name("CriticalOps");
-            if (pid <= 0) {
-                [strongSelf logLine:@"pid not found (attempt %d/30)", attempt + 1];
-                sleep(2);
-                continue;
-            }
-
-            mach_port_t task = MACH_PORT_NULL;
-            int rc = mr_attach(pid, &task);
-            if (rc != 0) {
-                [strongSelf logLine:@"task_for_pid(pid=%d) failed rc=%d (attempt %d/30)", pid, rc, attempt + 1];
-                sleep(2);
-                continue;
-            }
-
-            strongSelf->_pid = pid;
-            strongSelf->_task = task;
-            [strongSelf logLine:@"attached pid=%d", pid];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [strongSelf runDiagnostic];
-            });
+    for (int attempt = 0; attempt < 30; attempt++) {
+        if (gStopRequested.load()) {
+            [self logLine:@"scan stopped"];
             return;
         }
 
-        [strongSelf logLine:@"attach failed after 30 attempts"];
-    });
+        pid_t pid = mr_find_pid_by_name("CriticalOps");
+        if (pid > 0) {
+            mach_port_t task = MACH_PORT_NULL;
+            int rc = mr_attach(pid, &task);
+            lastRc = rc;
+            if (rc == 0) {
+                _pid = pid;
+                _task = task;
+                [self logLine:@"attached pid=%d", pid];
+                [self runDiagnostic];
+                return;
+            }
+        }
+
+        sleep(2);
+    }
+
+    [self logLine:@"attach failed rc=%d", lastRc];
 }
 
+/* Worker queue: all reads and the heap scan happen off the main thread;
+   every UI write goes through appendLog, which hops to the main queue. */
 - (void)runDiagnostic
 {
     mach_port_t task = _task;
     if (task == MACH_PORT_NULL) {
         [self logLine:@"no task port"];
+        return;
+    }
+
+    if (gStopRequested.load()) {
+        [self logLine:@"scan stopped"];
         return;
     }
 
@@ -272,12 +325,27 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
         return;
     }
 
+    if (gStopRequested.load()) {
+        [self logLine:@"scan stopped"];
+        return;
+    }
+
     [self logLine:@"scanning heap..."];
 
     uint64_t candidates[MAX_CANDIDATES];
     int count = scan_candidates(task, ctx.k1779, ctx.k7301, candidates, MAX_CANDIDATES);
 
+    if (count < 0) {
+        [self logLine:@"scan stopped"];
+        return;
+    }
+
     for (int i = 0; i < count; i++) {
+        if (gStopRequested.load()) {
+            [self logLine:@"scan stopped"];
+            return;
+        }
+
         uint64_t v = candidates[i];
         [self logLine:@"candidate[%d] @ 0x%llx", i, v];
 

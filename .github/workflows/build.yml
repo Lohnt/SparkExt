@@ -48,6 +48,12 @@ jobs:
           codesign --force --sign - --entitlements sources/entitlements.plist --timestamp=none "$APP"
           echo "--- verify ---"
           codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "--- embedded entitlements (signed executable) ---"
+          codesign -d --entitlements :- "$APP/$EXE" 2>&1 | tee "$RUNNER_TEMP/signed-entitlements.xml"
+          for key in task_for_pid-allow get-task-allow com.apple.private.cs.debugger platform-application; do
+            grep -q "<key>$key</key>" "$RUNNER_TEMP/signed-entitlements.xml" || { echo "ERROR: $key was not embedded in $EXE"; exit 1; }
+          done
+          echo "--- entitlement check: PASS ---"
           echo "--- CodeResources contents ---"
           cat "$APP/_CodeSignature/CodeResources" | head -80
           rm -f "$GITHUB_WORKSPACE/Diag.tipa"
@@ -59,6 +65,38 @@ jobs:
           rm -rf Payload
           cd "$GITHUB_WORKSPACE"
           ls -lh Diag.tipa
+      - name: Verify entitlements in Diag.tipa
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/verify"
+          mkdir -p "$RUNNER_TEMP/verify"
+          ditto -x -k Diag.tipa "$RUNNER_TEMP/verify"
+          BIN="$RUNNER_TEMP/verify/Payload/Diag.app/COPSDiag"
+          test -f "$BIN"
+          if command -v ldid >/dev/null 2>&1; then
+            echo "--- ldid -e Payload/Diag.app/COPSDiag ---"
+            ldid -e "$BIN" | tee "$GITHUB_WORKSPACE/entitlements-verify.txt"
+          else
+            echo "--- ldid not installed; codesign -d --entitlements :- ---"
+            codesign -d --entitlements :- "$BIN" 2>&1 | tee "$GITHUB_WORKSPACE/entitlements-verify.txt"
+          fi
+          echo ""
+          echo "--- entitlement keys ---"
+          for key in task_for_pid-allow get-task-allow com.apple.private.cs.debugger platform-application; do
+            if grep -q "<key>$key</key>" "$GITHUB_WORKSPACE/entitlements-verify.txt"; then
+              echo "present: $key"
+            else
+              echo "MISSING: $key"
+              exit 1
+            fi
+          done
+      - name: Upload entitlements dump
+        uses: actions/upload-artifact@v4
+        with:
+          name: Diag-entitlements
+          path: entitlements-verify.txt
+          if-no-files-found: error
+          retention-days: 30
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
