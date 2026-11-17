@@ -101,6 +101,11 @@ static const field_desc kActorFields[] = {
 /* Set from the main thread by the STOP button; polled by every loop. */
 static std::atomic<bool> gStopRequested(false);
 
+/* Pinned with `used` on purpose: clang folds a 5-byte literal handed straight
+   to snprintf() into an immediate store, which drops the token from the shipped
+   binary. Keeping it as a real object makes the SAME suffix verifiable. */
+__attribute__((used)) static const char kTailSame[] = " SAME";
+
 /* One K_1779 hit plus whether the K_7301 config link happens to hang off it.
    config_link is reported, never used as an acceptance gate. */
 typedef struct {
@@ -926,7 +931,7 @@ stopped:
             stats[3]++;
         } else if ([oldText isEqualToString:newText]) {
             p->diff = DIFF_SAME;
-            snprintf(p->tail, sizeof(p->tail), " SAME");
+            memcpy(p->tail, kTailSame, sizeof(kTailSame));
             stats[4]++;
         } else {
             p->diff = DIFF_CHANGED;
