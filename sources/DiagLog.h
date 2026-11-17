@@ -13,37 +13,55 @@
    as "=== previous run ===". */
 #define DIAG_BOOT_LOG_PATH "/var/mobile/Documents/diag_boot.log"
 
+/* Full verbose scan log. The screen shows only the compact view; everything
+   else (hop details, near-miss examples, reject dumps) lands here. */
+#define DIAG_SCAN_LOG_PATH "/var/mobile/Documents/diag_scan.log"
+
 /* Set once in main(), before UIApplicationMain. nil if the file could not be read. */
 extern NSString *gDiagPreviousRunLog;
+
+/* One line, one open/write/close. All errors are silently ignored: diagnostics
+   must never be able to abort the process. */
+static inline void diag_append_line(const char *path, const char *msg)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0)
+        return;
+
+    const char *p = msg;
+    size_t left = strlen(msg);
+    while (left > 0) {
+        ssize_t n = write(fd, p, left);
+        if (n <= 0)
+            break;
+        p += (size_t)n;
+        left -= (size_t)n;
+    }
+    write(fd, "\n", 1);
+    close(fd);
+}
 
 /* Launch breadcrumbs.
    Each call goes to four places on purpose:
      - the process stderr, flushed first so a crash one instruction later cannot
        lose the line (captured by TrollStore's launch console)
      - os_log / system log (Console.app, idevicesyslog)
-     - /var/mobile/Documents/diag_boot.log, appended synchronously; any error is
-       silently ignored
+     - /var/mobile/Documents/diag_boot.log, appended synchronously
    Keeping this header-only (static inline, no new .m) means no project changes. */
 static inline void diag_log(const char *msg)
 {
     fprintf(stderr, "%s\n", msg);
     fflush(stderr);
     NSLog(@"%s", msg);
+    diag_append_line(DIAG_BOOT_LOG_PATH, msg);
+}
 
-    int fd = open(DIAG_BOOT_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd >= 0) {
-        const char *p = msg;
-        size_t left = strlen(msg);
-        while (left > 0) {
-            ssize_t n = write(fd, p, left);
-            if (n <= 0)
-                break;
-            p += (size_t)n;
-            left -= (size_t)n;
-        }
-        write(fd, "\n", 1);
-        close(fd);
-    }
+/* Verbose scan log, file only. */
+static inline void diag_scan_log(NSString *line)
+{
+    const char *s = [line UTF8String];
+    if (s)
+        diag_append_line(DIAG_SCAN_LOG_PATH, s);
 }
 
 #endif /* DIAG_LOG_H */

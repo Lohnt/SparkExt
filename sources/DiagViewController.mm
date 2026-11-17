@@ -19,6 +19,7 @@
 #define RAW_DUMP_LIMIT 10
 #define CLASS_REGION_RADIUS 0x100000ULL
 #define INSTANCE_DUMP_SIZE 0x148
+#define HEAP_DUMP_LIMIT 3
 
 /* Set from the main thread by the STOP button; polled by every loop. */
 static std::atomic<bool> gStopRequested(false);
@@ -254,9 +255,11 @@ stopped:
 
 - (void)appendLog:(NSString *)line;
 - (void)logLine:(NSString *)fmt, ...;
+- (void)vlogLine:(NSString *)fmt, ...;
 - (void)logNearMiss:(NSString *)reason bucket:(const nm_bucket *)b;
 - (void)dumpCandidateRaw:(mach_port_t)task v:(uint64_t)v index:(int)idx reason:(const char *)reason;
 - (void)dumpInstance:(mach_port_t)task v:(uint64_t)v index:(int)idx;
+- (void)followPointers:(mach_port_t)task v:(uint64_t)v;
 - (void)reRun;
 - (void)rescan;
 - (void)stopScan;
@@ -368,45 +371,57 @@ stopped:
         [_textView scrollRangeToVisible:NSMakeRange(_textView.text.length - 1, 1)];
 }
 
+/* Screen and verbose file. */
 - (void)logLine:(NSString *)fmt, ...
 {
     va_list ap;
     va_start(ap, fmt);
     NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
+
+    diag_scan_log(line);
     [self appendLog:line];
+}
+
+/* Verbose file only: hop details, near-miss examples, reject dumps. */
+- (void)vlogLine:(NSString *)fmt, ...
+{
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+
+    diag_scan_log(line);
 }
 
 - (void)logNearMiss:(NSString *)reason bucket:(const nm_bucket *)b
 {
-    [self logLine:@"rejected: %@ = %llu", reason, b->total];
     for (int i = 0; i < b->count; i++)
-        [self logLine:@"  e.g. 0x%llx", b->ex[i]];
+        [self vlogLine:@"  e.g. %@ 0x%llx", reason, b->ex[i]];
 }
 
-/* Raw field dump for the first few rejected K_1779 hits: shows which of the
-   first nine qwords hold pointers and where those pointers land. */
+/* Raw field dump for rejected hits: verbose file only. */
 - (void)dumpCandidateRaw:(mach_port_t)task v:(uint64_t)v index:(int)idx reason:(const char *)reason
 {
-    [self logLine:@"--- reject[%d] V=0x%llx  (%s) ---", idx, v, reason];
-    [self logLine:@"  read64(V)  = 0x%llx", rd64(task, v)];
+    [self vlogLine:@"--- reject[%d] V=0x%llx  (%s) ---", idx, v, reason];
+    [self vlogLine:@"  read64(V)  = 0x%llx", rd64(task, v)];
 
     static const uint64_t offs[] = { 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40 };
     for (int k = 0; k < 7; k++) {
         uint64_t p = 0;
         if (!mr_read64(task, v + offs[k], &p)) {
-            [self logLine:@"  V+0x%02llx     = <unreadable>", offs[k]];
+            [self vlogLine:@"  V+0x%02llx     = <unreadable>", offs[k]];
         } else if (p == 0) {
-            [self logLine:@"  V+0x%02llx     = 0x0", offs[k]];
+            [self vlogLine:@"  V+0x%02llx     = 0x0", offs[k]];
         } else {
-            [self logLine:@"  V+0x%02llx     = 0x%llx -> read64 = 0x%llx",
-                       offs[k], p, rd64(task, p)];
+            [self vlogLine:@"  V+0x%02llx     = 0x%llx -> read64 = 0x%llx",
+                        offs[k], p, rd64(task, p)];
         }
     }
 }
 
 /* Ground truth: 0x148 bytes of the instance, 16 u64 per line, with the same
-   words below as float32 (x y z w ...). */
+   words below as float32 (x y z w ...). Shown on screen and in the file. */
 - (void)dumpInstance:(mach_port_t)task v:(uint64_t)v index:(int)idx
 {
     unsigned char buf[INSTANCE_DUMP_SIZE];
@@ -440,6 +455,25 @@ stopped:
 
         [self logLine:@"%@", hexLine];
         [self logLine:@"%@", f32Line];
+    }
+}
+
+/* Every plausible pointer in the instance, with its first two qwords. */
+- (void)followPointers:(mach_port_t)task v:(uint64_t)v
+{
+    [self logLine:@"FOLLOW ptrs:"];
+
+    for (uint64_t off = 0x10; off <= 0x140; off += 8) {
+        uint64_t p = 0;
+        if (!mr_read64(task, v + off, &p))
+            continue;
+        if (p < 0x100000000ULL || (p & 0xF) != 0)
+            continue;
+
+        uint64_t q = rd64(task, p);
+        uint64_t q2 = rd64(task, p + 8);
+        [self logLine:@"V+0x%02llx -> 0x%llx -> [0x%llx, 0x%llx]",
+                   (unsigned long long)off, p, q, q2];
     }
 }
 
@@ -559,6 +593,8 @@ stopped:
         return;
     }
 
+    [self vlogLine:@"=== scan start ==="];
+
     il2cpp_ctx ctx;
     il2cpp_bootstrap(task, &ctx);
     diag_log("diag: bootstrap ok");
@@ -592,6 +628,9 @@ stopped:
     [self logLine:@"scanning heap..."];
 
     cand_t candidates[MAX_CANDIDATES];
+    bool acceptedFlags[MAX_CANDIDATES];
+    memset(acceptedFlags, 0, sizeof(acceptedFlags));
+
     scan_report rep;
     CFAbsoluteTime tScan = CFAbsoluteTimeGetCurrent();
     int count = scan_candidates(task, ctx.k1779, ctx.k7301, ctx.def_table,
@@ -629,8 +668,6 @@ stopped:
 
     int accepted = 0;
     int dumpedRejects = 0;
-    int dumpedConfig = 0;
-    int dumpedHeap = 0;
 
     for (int i = 0; i < count; i++) {
         if (gStopRequested.load()) {
@@ -640,8 +677,8 @@ stopped:
 
         uint64_t v = candidates[i].v;
 
-        /* Quat is informational now: both paths are tried, the winner is
-           reported, but a bad quat never rejects a candidate. */
+        /* Quat is informational: both paths are tried, the winner is reported,
+           but a bad quat never rejects a candidate. */
         uint64_t quatPtr = 0;
         mr_quat quat;
         memset(&quat, 0, sizeof(quat));
@@ -694,51 +731,57 @@ stopped:
         uint64_t bp = 0;
         bool bpok = bok && mr_read64(task, b + 0x40, &bp) && bp != 0;
 
-        const char *tag = rangeOk ? "ACCEPT" : "REJECT";
-        [self logLine:@"cand[%d] %s @ 0x%llx  config_link=%d", i, tag, v,
-                   (int)candidates[i].config_link];
-        [self logLine:@"  read64(V)       = 0x%llx", rd64(task, v)];
-        [self logLine:@"  read64(V+0xC0)  = 0x%llx", quatPtr];
-        [self logLine:@"  quat            = (%.4f, %.4f, %.4f, %.4f) |q|=%.4f src=%s",
-                   quat.x, quat.y, quat.z, quat.w, qlen, qsrc];
-        [self logLine:@"  pos_a hop0      = read64(V+0x28)    = 0x%llx%s",
-                   h0, h0ok ? "" : "  <failed>"];
-        [self logLine:@"  pos_a hop1      = read64(hop0+0x18) = 0x%llx%s",
-                   h1, h1ok ? "" : "  <failed>"];
-        [self logLine:@"  pos_a xyz       = @hop1+0xD4        = (%.2f, %.2f, %.2f)%s",
-                   posA.x, posA.y, posA.z, vecOk ? "" : "  <failed>"];
-        [self logLine:@"  pos_b hop0      = read64(V+0x30)    = 0x%llx%s",
-                   b, bok ? "" : "  <failed>"];
-        [self logLine:@"  pos_b hop1      = read64(hop0+0x40) = 0x%llx%s",
-                   bp, bpok ? "" : "  <failed>"];
+        /* --- verbose detail, file only --- */
+        [self vlogLine:@"cand[%d] %s @ 0x%llx config_link=%d", i,
+                   rangeOk ? "ACCEPT" : "REJECT", v, (int)candidates[i].config_link];
+        [self vlogLine:@"  read64(V)       = 0x%llx", rd64(task, v)];
+        [self vlogLine:@"  read64(V+0xC0)  = 0x%llx", quatPtr];
+        [self vlogLine:@"  quat            = (%.4f, %.4f, %.4f, %.4f) |q|=%.4f src=%s",
+                    quat.x, quat.y, quat.z, quat.w, qlen, qsrc];
+        [self vlogLine:@"  pos_a hop0      = read64(V+0x28)    = 0x%llx%s",
+                    h0, h0ok ? "" : "  <failed>"];
+        [self vlogLine:@"  pos_a hop1      = read64(hop0+0x18) = 0x%llx%s",
+                    h1, h1ok ? "" : "  <failed>"];
+        [self vlogLine:@"  pos_a xyz       = @hop1+0xD4        = (%.2f, %.2f, %.2f)%s",
+                    posA.x, posA.y, posA.z, vecOk ? "" : "  <failed>"];
+        [self vlogLine:@"  pos_b hop0      = read64(V+0x30)    = 0x%llx%s",
+                    b, bok ? "" : "  <failed>"];
+        [self vlogLine:@"  pos_b hop1      = read64(hop0+0x40) = 0x%llx%s",
+                    bp, bpok ? "" : "  <failed>"];
+
+        /* --- compact screen line --- */
+        [self logLine:@"cand[%d] V=0x%llx cfg=%d |q|=%.4f pos_a=(%.2f, %.2f, %.2f)",
+                   i, v, (int)candidates[i].config_link, qlen, posA.x, posA.y, posA.z];
 
         if (rangeOk) {
             accepted++;
+            acceptedFlags[i] = true;
 
             mr_vec3 posB;
             memset(&posB, 0, sizeof(posB));
             bool b0ok = bpok && mr_read_vec3(task, bp + 0x10, &posB);
-            [self logLine:@"  pos_b0 xyz      = @hop1+0x10        = (%.2f, %.2f, %.2f)%s",
-                       posB.x, posB.y, posB.z, b0ok ? "" : "  <failed>"];
+            [self vlogLine:@"  pos_b0 xyz      = @hop1+0x10        = (%.2f, %.2f, %.2f)%s",
+                        posB.x, posB.y, posB.z, b0ok ? "" : "  <failed>"];
 
             memset(&posB, 0, sizeof(posB));
             bool b1ok = bpok && mr_read_vec3(task, bp + 0x1C, &posB);
-            [self logLine:@"  pos_b1 xyz      = @hop1+0x1C        = (%.2f, %.2f, %.2f)%s",
-                       posB.x, posB.y, posB.z, b1ok ? "" : "  <failed>"];
+            [self vlogLine:@"  pos_b1 xyz      = @hop1+0x1C        = (%.2f, %.2f, %.2f)%s",
+                        posB.x, posB.y, posB.z, b1ok ? "" : "  <failed>"];
 
             memset(&posB, 0, sizeof(posB));
             bool b2ok = bpok && mr_read_vec3(task, bp + 0x2C, &posB);
-            [self logLine:@"  pos_b2 xyz      = @hop1+0x2C        = (%.2f, %.2f, %.2f)%s",
-                       posB.x, posB.y, posB.z, b2ok ? "" : "  <failed>"];
+            [self vlogLine:@"  pos_b2 xyz      = @hop1+0x2C        = (%.2f, %.2f, %.2f)%s",
+                        posB.x, posB.y, posB.z, b2ok ? "" : "  <failed>"];
 
             memset(&posB, 0, sizeof(posB));
             bool b3ok = bpok && mr_read_vec3(task, bp + 0x38, &posB);
-            [self logLine:@"  pos_b3 xyz      = @hop1+0x38        = (%.2f, %.2f, %.2f)%s",
-                       posB.x, posB.y, posB.z, b3ok ? "" : "  <failed>"];
+            [self vlogLine:@"  pos_b3 xyz      = @hop1+0x38        = (%.2f, %.2f, %.2f)%s",
+                        posB.x, posB.y, posB.z, b3ok ? "" : "  <failed>"];
 
-            [self logLine:@"  self            = %d", (int)rd8(task, v + 0x128)];
-            [self logLine:@"  td5878 i0/i1/i2 = %d / %d / %d",
-                       (int)rd32(task, b + 0x10), (int)rd32(task, b + 0x14), (int)rd32(task, b + 0x18)];
+            [self vlogLine:@"  self            = %d", (int)rd8(task, v + 0x128)];
+            [self vlogLine:@"  td5878 i0/i1/i2 = %d / %d / %d",
+                        (int)rd32(task, b + 0x10), (int)rd32(task, b + 0x14),
+                        (int)rd32(task, b + 0x18)];
         } else {
             int nb = vecOk ? 1 : 0;
             nm_add(&nm[nb], v);
@@ -748,24 +791,29 @@ stopped:
                 [self dumpCandidateRaw:task v:v index:i reason:nmNames[nb]];
             }
         }
-
-        /* Ground truth dumps: the config_link=1 instance (whatever its
-           acceptance state), then up to two accepted heap instances. */
-        BOOL wantDump = NO;
-        if (candidates[i].config_link && dumpedConfig < 1) {
-            dumpedConfig++;
-            wantDump = YES;
-        } else if (rangeOk && v > ctx.uf_base && dumpedHeap < 2) {
-            dumpedHeap++;
-            wantDump = YES;
-        }
-        if (wantDump)
-            [self dumpInstance:task v:v index:i];
     }
 
-    [self logLine:@"--- near-misses ---"];
+    /* Near-miss counters on screen; the example addresses stay in the file. */
+    [self logLine:@"rejected: %s = %llu", nmNames[0], nm[0].total];
+    [self logLine:@"rejected: %s = %llu", nmNames[1], nm[1].total];
     for (int k = 0; k < 2; k++)
         [self logNearMiss:[NSString stringWithUTF8String:nmNames[k]] bucket:&nm[k]];
+
+    /* Ground truth dumps: the config_link=1 instance (whatever its acceptance
+       state), then up to three accepted heap instances. */
+    int cfgDumped = 0;
+    int heapDumps = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (candidates[i].config_link && cfgDumped < 1) {
+            cfgDumped = 1;
+            [self dumpInstance:task v:candidates[i].v index:i];
+            [self followPointers:task v:candidates[i].v];
+        } else if (acceptedFlags[i] && candidates[i].v > ctx.uf_base && heapDumps < HEAP_DUMP_LIMIT) {
+            heapDumps++;
+            [self dumpInstance:task v:candidates[i].v index:i];
+        }
+    }
 
     [self logLine:@"scan complete: %d accepted / %d candidates", accepted, count];
     diag_log("diag: scan complete");
