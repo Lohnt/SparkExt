@@ -31,12 +31,25 @@ jobs:
             EXPANDED_CODE_SIGN_IDENTITY="" \
             IPHONEOS_DEPLOYMENT_TARGET=15.0 \
             build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
-      - name: Sign ad-hoc and package
+      - name: Sign and package
         run: |
           set -euo pipefail
           APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/Diag.app"
           if [ ! -d "$APP" ]; then echo "App bundle missing at $APP"; exit 1; fi
-          codesign --force --sign - --entitlements sources/entitlements.plist "$APP"
+          echo "--- executable name ---"
+          EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          echo "CFBundleExecutable = $EXE"
+          test -f "$APP/$EXE"
+          echo "--- strip old signature ---"
+          codesign --remove-signature "$APP" || true
+          echo "--- sign executable with entitlements ---"
+          codesign --force --sign - --entitlements sources/entitlements.plist --timestamp=none "$APP/$EXE"
+          echo "--- sign bundle ---"
+          codesign --force --sign - --entitlements sources/entitlements.plist --timestamp=none "$APP"
+          echo "--- verify ---"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "--- CodeResources contents ---"
+          cat "$APP/_CodeSignature/CodeResources" | head -80
           rm -rf "$RUNNER_TEMP/Payload" "$GITHUB_WORKSPACE/Diag.tipa"
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -R "$APP" "$RUNNER_TEMP/Payload/"
