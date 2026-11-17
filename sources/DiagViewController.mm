@@ -186,6 +186,19 @@ static bool meta_range_ok(uint64_t p, uint64_t meta)
 }
 
 /* A metadata string that looks like a class name: short, printable, no spaces. */
+/* Kept out of line on purpose: clang folds strcmp() against a short literal
+   into immediate compares, which hides the tokens from the shipped binary.
+   This way "Component" / "Behaviour" / "Transform" stay verifiable strings. */
+__attribute__((noinline))
+static bool diag_streq(const char *a, const char *b)
+{
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 static bool meta_name_ok(const char *s)
 {
     if (!s)
@@ -304,7 +317,7 @@ static void build_chain(mach_port_t task, uint64_t cls, uint64_t nameOff, uint64
             break;
         }
 
-        if (strcmp(nm, "Transform") == 0 && hasTransform)
+        if (diag_streq(nm, "Transform") && hasTransform)
             *hasTransform = true;
 
         size_t add = strlen(nm);
@@ -1102,7 +1115,9 @@ stopped:
     uint64_t parentOff = 0;
     for (uint64_t off = 0; off <= PARENT_PROBE_END; off += 8) {
         uint64_t p = rd64(task, tfCls + off);
-        if (p < HUNT_PTR_MIN || (p & 0xF) != 0)
+        /* Class objects are at least 8-aligned; 16 is the common case but not
+           guaranteed, so 8 is used here to avoid missing the parent. */
+        if (p < HUNT_PTR_MIN || (p & 0x7) != 0)
             continue;
 
         char pnm[40];
@@ -1113,7 +1128,7 @@ stopped:
         if (!ok)
             continue;
 
-        bool isParent = (strcmp(pnm, "Component") == 0 || strcmp(pnm, "Behaviour") == 0);
+        bool isParent = (diag_streq(pnm, "Component") || diag_streq(pnm, "Behaviour"));
         [self logLine:@"  parent? +0x%02llx -> 0x%llx  %s%s", off, p, pnm,
                    isParent ? "  <-- PARENT_OFF" : ""];
         if (isParent && !parentOff)
