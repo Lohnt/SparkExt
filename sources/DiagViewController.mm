@@ -9,17 +9,36 @@
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #define MAX_CANDIDATES 256
 #define SCAN_CHUNK_SIZE (1u << 20)
-#define NEAR_MISS_EXAMPLES 10
-#define RAW_DUMP_LIMIT 10
 #define CLASS_REGION_RADIUS 0x100000ULL
-#define INSTANCE_DUMP_SIZE 0x148
-#define HEAP_DUMP_LIMIT 3
+
+/* --- BFS field hunter ---------------------------------------------------- */
+#define HUNT_CAND_LIMIT    8
+#define HUNT_OBJ_BUDGET    48
+#define HUNT_MAX_DEPTH     2
+#define HUNT_L0_SIZE       0x148     /* V+0x00 .. V+0x148 */
+#define HUNT_LN_SIZE       0x100     /* p+0x00 .. p+0x100, level 1 and 2 */
+#define HUNT_QUAT_MAX      8
+#define HUNT_POS_MAX       8
+#define HUNT_INT_MAX       3
+#define HUNT_HITS_PER_OBJ  (HUNT_QUAT_MAX + HUNT_POS_MAX + HUNT_INT_MAX)
+#define HUNT_HITS_PER_CAND (HUNT_OBJ_BUDGET * HUNT_HITS_PER_OBJ)
+#define HUNT_PTR_MIN       0x100000000ULL
+#define HUNT_PTR_SPAN      0x40000000ULL
+#define HUNT_POS_LIMIT     5000.0f
+#define HUNT_PATH_LEN      128
+#define HUNT_TEXT_LEN      72
+#define HUNT_TAIL_LEN      128
+#define SCREEN_HIT_LIMIT   80
+
+enum { HUNT_QUAT = 0, HUNT_POS = 1, HUNT_INT100 = 2 };
+enum { DIFF_NEW = 0, DIFF_SAME = 1, DIFF_CHANGED = 2 };
 
 /* Set from the main thread by the STOP button; polled by every loop. */
 static std::atomic<bool> gStopRequested(false);
@@ -46,19 +65,27 @@ typedef struct {
     double   elapsed;
 } scan_report;
 
-/* Rejection bucket: total count plus the first few offending addresses. */
+/* One visited object in the breadth-first walk. level 0 is the candidate
+   itself, level 1 a pointer taken from it, level 2 a pointer from one of
+   those. path is the full route, e.g. "V+0x18->0x11abd6bf0+0x20->0x11abd7120". */
 typedef struct {
-    uint64_t total;
-    uint64_t ex[NEAR_MISS_EXAMPLES];
-    int      count;
-} nm_bucket;
+    uint64_t addr;
+    int      level;
+    char     path[HUNT_PATH_LEN];
+} hunt_obj;
 
-static void nm_add(nm_bucket *b, uint64_t addr)
-{
-    b->total++;
-    if (b->count < NEAR_MISS_EXAMPLES)
-        b->ex[b->count++] = addr;
-}
+/* One field hit inside a visited object, with its pre-rendered value text and
+   the differential suffix ("", " SAME", " CHANGED (old -> new)"). */
+typedef struct {
+    int      kind;
+    int      obj;
+    uint32_t off;
+    int      nv;
+    float    v[4];
+    int      diff;
+    char     text[HUNT_TEXT_LEN];
+    char     tail[HUNT_TAIL_LEN];
+} hunt_hit;
 
 static uint64_t rd64(mach_port_t task, uint64_t addr)
 {
@@ -67,39 +94,9 @@ static uint64_t rd64(mach_port_t task, uint64_t addr)
     return v;
 }
 
-static uint32_t rd32(mach_port_t task, uint64_t addr)
-{
-    uint32_t v = 0;
-    mr_read32(task, addr, &v);
-    return v;
-}
-
-static uint8_t rd8(mach_port_t task, uint64_t addr)
-{
-    uint8_t v = 0;
-    mr_read8(task, addr, &v);
-    return v;
-}
-
 static uint64_t dist64(uint64_t a, uint64_t b)
 {
     return a > b ? a - b : b - a;
-}
-
-/* A position is plausible if it is finite and inside the playable world box. */
-static bool diag_vec3_in_range(mr_vec3 v)
-{
-    const float limit = 100000.0f;
-    if (!isfinite(v.x) || !isfinite(v.y) || !isfinite(v.z))
-        return false;
-    return fabsf(v.x) <= limit && fabsf(v.y) <= limit && fabsf(v.z) <= limit;
-}
-
-/* Unity rotations are unit quaternions; a dead slot reads as all-zero. */
-static bool diag_quat_unit_ok(const mr_quat *q)
-{
-    float len = sqrtf(q->x * q->x + q->y * q->y + q->z * q->z + q->w * q->w);
-    return isfinite(len) && len >= 0.9f && len <= 1.1f;
 }
 
 /* Sleep in 0.25 s slices so STOP is honoured during the attach retry backoff.
@@ -113,6 +110,183 @@ static bool diag_sleep_checked(double seconds)
         usleep(250000);
     }
     return gStopRequested.load();
+}
+
+/* A qword is treated as an object pointer when it is 16-byte aligned and sits
+   between the first usable heap page and the end of the UnityFramework span.
+   That excludes small ints, tags, and metadata addresses in the Mach-O. */
+static bool hunt_ptr_ok(uint64_t p, uint64_t uf_base)
+{
+    if (p < HUNT_PTR_MIN)
+        return false;
+    if (p > uf_base + HUNT_PTR_SPAN)
+        return false;
+    if ((p & 0xF) != 0)
+        return false;
+    return true;
+}
+
+/* Reads as much of the object as the mapping allows. Heap objects can end at a
+   page boundary, so a failed full-size read is retried with smaller sizes
+   instead of discarding the object. */
+static size_t hunt_read_obj(mach_port_t task, uint64_t addr, uint8_t *buf, size_t want)
+{
+    size_t trySize = want;
+    for (int guard = 0; guard < 8; guard++) {
+        if (trySize < 8)
+            trySize = 8;
+        if (mr_read(task, addr, buf, trySize))
+            return trySize;
+        if (trySize == 8)
+            break;
+        trySize /= 2;
+    }
+    return 0;
+}
+
+/* Breadth-first pointer walk, depth 2, deduplicated across the whole walk and
+   capped at maxobjs objects. Returns the number of objects recorded. */
+static int hunt_walk(mach_port_t task, uint64_t v, uint64_t uf_base,
+                     hunt_obj *objs, int maxobjs)
+{
+    if (maxobjs < 1)
+        return 0;
+
+    int n = 0;
+    memset(&objs[0], 0, sizeof(objs[0]));
+    objs[0].addr = v;
+    objs[0].level = 0;
+    snprintf(objs[0].path, sizeof(objs[0].path), "V");
+    n = 1;
+
+    int levelBegin = 0;
+    int levelEnd = 1;
+
+    for (int depth = 1; depth <= HUNT_MAX_DEPTH && n < maxobjs; depth++) {
+        int nextBegin = n;
+        uint8_t buf[HUNT_L0_SIZE];
+
+        for (int i = levelBegin; i < levelEnd && n < maxobjs; i++) {
+            if (gStopRequested.load())
+                return n;
+
+            size_t want = objs[i].level == 0 ? HUNT_L0_SIZE : HUNT_LN_SIZE;
+            size_t have = hunt_read_obj(task, objs[i].addr, buf, want);
+            if (have == 0)
+                continue;
+
+            for (size_t off = 0; off + 8 <= have && n < maxobjs; off += 8) {
+                uint64_t p = 0;
+                memcpy(&p, buf + off, sizeof(p));
+                if (!hunt_ptr_ok(p, uf_base))
+                    continue;
+
+                bool dup = false;
+                for (int k = 0; k < n; k++) {
+                    if (objs[k].addr == p) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup)
+                    continue;
+
+                hunt_obj *o = &objs[n];
+                memset(o, 0, sizeof(*o));
+                o->addr = p;
+                o->level = depth;
+                snprintf(o->path, sizeof(o->path), "%s+0x%02zx->0x%llx",
+                         objs[i].path, off, (unsigned long long)p);
+                n++;
+            }
+        }
+
+        if (n == nextBegin)
+            break;
+        levelBegin = nextBegin;
+        levelEnd = n;
+    }
+
+    return n;
+}
+
+/* Scans one object's bytes for the three field signatures. */
+static int hunt_object(const uint8_t *buf, size_t size, int objidx,
+                       hunt_hit *out, int maxout)
+{
+    int n = 0;
+
+    /* a) unit quaternion: 16-byte aligned, 4 finite floats, 0.9 <= |q| <= 1.1 */
+    int quats = 0;
+    for (size_t off = 0; off + 16 <= size && quats < HUNT_QUAT_MAX && n < maxout; off += 16) {
+        float f[4];
+        memcpy(f, buf + off, sizeof(f));
+        if (!isfinite(f[0]) || !isfinite(f[1]) || !isfinite(f[2]) || !isfinite(f[3]))
+            continue;
+
+        float len = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2] + f[3] * f[3]);
+        if (!(len >= 0.9f && len <= 1.1f))
+            continue;
+
+        hunt_hit *h = &out[n++];
+        memset(h, 0, sizeof(*h));
+        h->kind = HUNT_QUAT;
+        h->obj = objidx;
+        h->off = (uint32_t)off;
+        h->nv = 4;
+        memcpy(h->v, f, sizeof(f));
+        snprintf(h->text, sizeof(h->text), "(%.4f,%.4f,%.4f,%.4f)", f[0], f[1], f[2], f[3]);
+        quats++;
+    }
+
+    /* b) position: 4-byte aligned vec3, finite, |comp| <= 5000, not all zero.
+       A magnitude floor drops small integers reinterpreted as floats (1e-40
+       denormals), which would otherwise fill every object. */
+    int poss = 0;
+    for (size_t off = 0; off + 12 <= size && poss < HUNT_POS_MAX && n < maxout; off += 4) {
+        float f[3];
+        memcpy(f, buf + off, sizeof(f));
+        if (!isfinite(f[0]) || !isfinite(f[1]) || !isfinite(f[2]))
+            continue;
+        if (fabsf(f[0]) > HUNT_POS_LIMIT || fabsf(f[1]) > HUNT_POS_LIMIT ||
+            fabsf(f[2]) > HUNT_POS_LIMIT)
+            continue;
+
+        float mag = fmaxf(fabsf(f[0]), fmaxf(fabsf(f[1]), fabsf(f[2])));
+        if (mag < 0.001f)
+            continue;
+
+        hunt_hit *h = &out[n++];
+        memset(h, 0, sizeof(*h));
+        h->kind = HUNT_POS;
+        h->obj = objidx;
+        h->off = (uint32_t)off;
+        h->nv = 3;
+        memcpy(h->v, f, sizeof(f));
+        snprintf(h->text, sizeof(h->text), "(%.3f,%.3f,%.3f)", f[0], f[1], f[2]);
+        poss++;
+    }
+
+    /* c) int32 == 100: health-style counter */
+    int ints = 0;
+    for (size_t off = 0; off + 4 <= size && ints < HUNT_INT_MAX && n < maxout; off += 4) {
+        uint32_t u = 0;
+        memcpy(&u, buf + off, sizeof(u));
+        if (u != 100u)
+            continue;
+
+        hunt_hit *h = &out[n++];
+        memset(h, 0, sizeof(*h));
+        h->kind = HUNT_INT100;
+        h->obj = objidx;
+        h->off = (uint32_t)off;
+        h->nv = 1;
+        h->v[0] = 100.0f;
+        snprintf(h->text, sizeof(h->text), "100");
+        ints++;
+    }
+
+    return n;
 }
 
 /* Returns the number of candidates found, or -1 if a stop was requested.
@@ -251,15 +425,16 @@ stopped:
     mach_port_t _task;
     pid_t _pid;
     dispatch_queue_t _workQueue;
+
+    /* Previous scan's hit values, keyed by "path|kind|offset". Lives across
+       scans so RESCAN can label hits SAME or CHANGED. */
+    NSMutableDictionary *_hitCache;
 }
 
 - (void)appendLog:(NSString *)line;
 - (void)logLine:(NSString *)fmt, ...;
 - (void)vlogLine:(NSString *)fmt, ...;
-- (void)logNearMiss:(NSString *)reason bucket:(const nm_bucket *)b;
-- (void)dumpCandidateRaw:(mach_port_t)task v:(uint64_t)v index:(int)idx reason:(const char *)reason;
-- (void)dumpInstance:(mach_port_t)task v:(uint64_t)v index:(int)idx;
-- (void)followPointers:(mach_port_t)task v:(uint64_t)v;
+- (NSString *)hitLine:(const hunt_hit *)h objs:(const hunt_obj *)objs;
 - (void)reRun;
 - (void)rescan;
 - (void)stopScan;
@@ -280,6 +455,7 @@ stopped:
     _task = MACH_PORT_NULL;
     _pid = 0;
     _workQueue = dispatch_queue_create("dev.cops.diag.work", DISPATCH_QUEUE_SERIAL);
+    _hitCache = [NSMutableDictionary dictionary];
 
     self.view.backgroundColor = [UIColor blackColor];
 
@@ -383,7 +559,7 @@ stopped:
     [self appendLog:line];
 }
 
-/* Verbose file only: hop details, near-miss examples, reject dumps. */
+/* Verbose file only: object walk, hits that did not fit on screen. */
 - (void)vlogLine:(NSString *)fmt, ...
 {
     va_list ap;
@@ -394,87 +570,24 @@ stopped:
     diag_scan_log(line);
 }
 
-- (void)logNearMiss:(NSString *)reason bucket:(const nm_bucket *)b
+- (NSString *)hitLine:(const hunt_hit *)h objs:(const hunt_obj *)objs
 {
-    for (int i = 0; i < b->count; i++)
-        [self vlogLine:@"  e.g. %@ 0x%llx", reason, b->ex[i]];
-}
+    const char *kind = "QUAT  ";
+    if (h->kind == HUNT_POS)
+        kind = "POS   ";
+    else if (h->kind == HUNT_INT100)
+        kind = "INT100";
 
-/* Raw field dump for rejected hits: verbose file only. */
-- (void)dumpCandidateRaw:(mach_port_t)task v:(uint64_t)v index:(int)idx reason:(const char *)reason
-{
-    [self vlogLine:@"--- reject[%d] V=0x%llx  (%s) ---", idx, v, reason];
-    [self vlogLine:@"  read64(V)  = 0x%llx", rd64(task, v)];
+    if (h->kind == HUNT_INT100)
+        return [NSString stringWithFormat:@"%s %s @+0x%02x%s",
+                kind, objs[h->obj].path, (unsigned)h->off, h->tail];
 
-    static const uint64_t offs[] = { 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40 };
-    for (int k = 0; k < 7; k++) {
-        uint64_t p = 0;
-        if (!mr_read64(task, v + offs[k], &p)) {
-            [self vlogLine:@"  V+0x%02llx     = <unreadable>", offs[k]];
-        } else if (p == 0) {
-            [self vlogLine:@"  V+0x%02llx     = 0x0", offs[k]];
-        } else {
-            [self vlogLine:@"  V+0x%02llx     = 0x%llx -> read64 = 0x%llx",
-                        offs[k], p, rd64(task, p)];
-        }
-    }
-}
+    if (h->kind == HUNT_QUAT)
+        return [NSString stringWithFormat:@"%s %s @+0x%02x q=%s%s",
+                kind, objs[h->obj].path, (unsigned)h->off, h->text, h->tail];
 
-/* Ground truth: 0x148 bytes of the instance, 16 u64 per line, with the same
-   words below as float32 (x y z w ...). Shown on screen and in the file. */
-- (void)dumpInstance:(mach_port_t)task v:(uint64_t)v index:(int)idx
-{
-    unsigned char buf[INSTANCE_DUMP_SIZE];
-    memset(buf, 0, sizeof(buf));
-
-    if (!mr_read(task, v, buf, sizeof(buf))) {
-        [self logLine:@"DUMP cand[%d] V=0x%llx <unreadable>", idx, v];
-        return;
-    }
-
-    [self logLine:@"DUMP cand[%d] V=0x%llx", idx, v];
-
-    for (size_t off = 0; off < INSTANCE_DUMP_SIZE; off += 128) {
-        size_t avail = INSTANCE_DUMP_SIZE - off;
-        size_t words = (avail < 128 ? avail : 128) / 8;
-
-        NSMutableString *hexLine = [NSMutableString stringWithFormat:@"  +0x%03zx  ", off];
-        NSMutableString *f32Line = [NSMutableString stringWithString:@"  f32       "];
-
-        for (size_t w = 0; w < words; w++) {
-            uint64_t word = 0;
-            memcpy(&word, buf + off + w * 8, sizeof(word));
-            [hexLine appendFormat:@"0x%016llx ", (unsigned long long)word];
-
-            float f[2];
-            memcpy(f, buf + off + w * 8, sizeof(f));
-            if (w % 2 == 0)
-                [f32Line appendString:@" "];
-            [f32Line appendFormat:@"%10.3f %10.3f ", f[0], f[1]];
-        }
-
-        [self logLine:@"%@", hexLine];
-        [self logLine:@"%@", f32Line];
-    }
-}
-
-/* Every plausible pointer in the instance, with its first two qwords. */
-- (void)followPointers:(mach_port_t)task v:(uint64_t)v
-{
-    [self logLine:@"FOLLOW ptrs:"];
-
-    for (uint64_t off = 0x10; off <= 0x140; off += 8) {
-        uint64_t p = 0;
-        if (!mr_read64(task, v + off, &p))
-            continue;
-        if (p < 0x100000000ULL || (p & 0xF) != 0)
-            continue;
-
-        uint64_t q = rd64(task, p);
-        uint64_t q2 = rd64(task, p + 8);
-        [self logLine:@"V+0x%02llx -> 0x%llx -> [0x%llx, 0x%llx]",
-                   (unsigned long long)off, p, q, q2];
-    }
+    return [NSString stringWithFormat:@"%s %s @+0x%02x %s%s",
+            kind, objs[h->obj].path, (unsigned)h->off, h->text, h->tail];
 }
 
 /* Main thread: cancel any in-flight work and queue a fresh run on the worker. */
@@ -511,7 +624,8 @@ stopped:
     [self startRun];
 }
 
-/* RESCAN: same as RE-RUN, but reachable next to STOP and always instrumented. */
+/* RESCAN: same as RE-RUN, but reachable next to STOP and always instrumented.
+   The hit cache survives, so the second pass reports SAME/CHANGED. */
 - (void)rescan
 {
     if (![NSThread isMainThread]) {
@@ -578,8 +692,8 @@ stopped:
     [self logLine:@"attach failed rc=%d", lastRc];
 }
 
-/* Worker queue: all reads and the heap scan happen off the main thread;
-   every UI write goes through appendLog, which hops to the main queue. */
+/* Worker queue: all reads, the heap scan and the BFS hunt happen off the main
+   thread; every UI write goes through appendLog, which hops to the main queue. */
 - (void)runDiagnostic
 {
     mach_port_t task = _task;
@@ -599,21 +713,20 @@ stopped:
     il2cpp_bootstrap(task, &ctx);
     diag_log("diag: bootstrap ok");
 
-    [self logLine:@"uf_base = 0x%llx", ctx.uf_base];
     if (!ctx.uf_base) {
         [self logLine:@"FAIL: UnityFramework Mach-O not found"];
         return;
     }
 
-    [self logLine:@"metadata_base = 0x%llx", ctx.metadata_base];
-    [self logLine:@"name = %s", ctx.name];
-    [self logLine:@"name_verify: %s", ctx.name_ok ? "PASS" : "FAIL"];
-    [self logLine:@"def_table = 0x%llx", ctx.def_table];
-    [self logLine:@"K_1779 = 0x%llx", ctx.k1779];
-    [self logLine:@"K_7301 = 0x%llx", ctx.k7301];
-    [self logLine:@"verify_name_ptr: %s", ctx.name_ptr_ok ? "PASS" : "FAIL"];
-    [self logLine:@"verify_instance_size: %s", ctx.instance_size_ok ? "PASS" : "FAIL"];
-    [self logLine:@"verify_token: %s", ctx.token_ok ? "PASS" : "FAIL"];
+    /* Bootstrap checks stay on screen, compressed to four lines. */
+    [self logLine:@"uf_base = 0x%llx  def_table = 0x%llx", ctx.uf_base, ctx.def_table];
+    [self logLine:@"K_1779 = 0x%llx  K_7301 = 0x%llx", ctx.k1779, ctx.k7301];
+    [self logLine:@"name = %s (%s) size:%s token:%s  name_ptr:%s", ctx.name,
+               ctx.name_ok ? "PASS" : "FAIL",
+               ctx.instance_size_ok ? "PASS" : "FAIL",
+               ctx.token_ok ? "PASS" : "FAIL",
+               ctx.name_ptr_ok ? "PASS" : "FAIL"];
+    [self vlogLine:@"metadata_base = 0x%llx", ctx.metadata_base];
 
     if (!ctx.k1779) {
         [self logLine:@"FAIL: K_1779 unavailable"];
@@ -628,9 +741,6 @@ stopped:
     [self logLine:@"scanning heap..."];
 
     cand_t candidates[MAX_CANDIDATES];
-    bool acceptedFlags[MAX_CANDIDATES];
-    memset(acceptedFlags, 0, sizeof(acceptedFlags));
-
     scan_report rep;
     CFAbsoluteTime tScan = CFAbsoluteTimeGetCurrent();
     int count = scan_candidates(task, ctx.k1779, ctx.k7301, ctx.def_table,
@@ -659,163 +769,221 @@ stopped:
         return;
     }
 
-    static const char *nmNames[2] = {
-        "pos_a chain unresolved",
-        "pos out of range",
-    };
-    nm_bucket nm[2];
-    memset(nm, 0, sizeof(nm));
+    if (count == 0) {
+        [self logLine:@"hunt complete: 0 objects / 0 quat / 0 pos / 0 int100"];
+        return;
+    }
 
-    int accepted = 0;
-    int dumpedRejects = 0;
+    /* The full candidate list is useful in the file only. */
+    for (int i = 0; i < count; i++)
+        [self vlogLine:@"cand[%d] V=0x%llx cfg=%d", i, candidates[i].v,
+                    (int)candidates[i].config_link];
 
-    for (int i = 0; i < count; i++) {
+    /* --- candidate selection: config_link first, then distinct V+0x28 --- */
+    int sel[HUNT_CAND_LIMIT];
+    int nsel = 0;
+    uint64_t seen[HUNT_CAND_LIMIT + 1];
+    int nseen = 0;
+
+    for (int i = 0; i < count && nsel < HUNT_CAND_LIMIT; i++) {
+        if (!candidates[i].config_link)
+            continue;
+        uint64_t f = rd64(task, candidates[i].v + 0x28);
+        sel[nsel++] = i;
+        if (nseen < HUNT_CAND_LIMIT + 1)
+            seen[nseen++] = f;
+    }
+
+    for (int i = 0; i < count && nsel < HUNT_CAND_LIMIT; i++) {
+        if (candidates[i].config_link)
+            continue;
+
+        uint64_t f = rd64(task, candidates[i].v + 0x28);
+        bool dup = false;
+        for (int k = 0; k < nseen; k++) {
+            if (seen[k] == f) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+
+        if (nseen < HUNT_CAND_LIMIT + 1)
+            seen[nseen++] = f;
+        sel[nsel++] = i;
+    }
+
+    [self vlogLine:@"hunt: %d of %d candidates selected (budget %d objects each)",
+                nsel, count, HUNT_OBJ_BUDGET];
+
+    hunt_obj *objs = (hunt_obj *)calloc((size_t)nsel * HUNT_OBJ_BUDGET, sizeof(hunt_obj));
+    hunt_hit *hits = (hunt_hit *)calloc((size_t)nsel * HUNT_HITS_PER_CAND, sizeof(hunt_hit));
+    int objCount[HUNT_CAND_LIMIT];
+    int hitCount[HUNT_CAND_LIMIT];
+    memset(objCount, 0, sizeof(objCount));
+    memset(hitCount, 0, sizeof(hitCount));
+
+    if (!objs || !hits) {
+        free(objs);
+        free(hits);
+        [self logLine:@"hunt: out of memory"];
+        return;
+    }
+
+    /* --- BFS walk + signature hunt --------------------------------------- */
+    int totalObjs = 0;
+    int totalHits = 0;
+
+    for (int s = 0; s < nsel; s++) {
         if (gStopRequested.load()) {
+            free(objs);
+            free(hits);
             [self logLine:@"scan stopped"];
             return;
         }
 
-        uint64_t v = candidates[i].v;
+        uint64_t v = candidates[sel[s]].v;
+        hunt_obj *o = objs + (size_t)s * HUNT_OBJ_BUDGET;
+        hunt_hit *h = hits + (size_t)s * HUNT_HITS_PER_CAND;
 
-        /* Quat is informational: both paths are tried, the winner is reported,
-           but a bad quat never rejects a candidate. */
-        uint64_t quatPtr = 0;
-        mr_quat quat;
-        memset(&quat, 0, sizeof(quat));
-        mr_quat dq;
-        memset(&dq, 0, sizeof(dq));
-        mr_quat iq;
-        memset(&iq, 0, sizeof(iq));
+        [self vlogLine:@"SEL[%d] cand[%d] V=0x%llx cfg=%d", s, sel[s], v,
+                    (int)candidates[sel[s]].config_link];
 
-        const char *qsrc = "none";
-        bool derefRead = (mr_read64(task, v + 0xC0, &quatPtr) && quatPtr != 0) &&
-                         mr_read_quat(task, quatPtr + 0x78, &dq);
-        bool derefUnit = derefRead && diag_quat_unit_ok(&dq);
+        int nobj = hunt_walk(task, v, ctx.uf_base, o, HUNT_OBJ_BUDGET);
+        objCount[s] = nobj;
+        totalObjs += nobj;
 
-        bool inlineRead = mr_read_quat(task, v + 0xC0, &iq);
-        bool inlineUnit = inlineRead && diag_quat_unit_ok(&iq);
+        uint8_t buf[HUNT_L0_SIZE];
+        int hc = 0;
 
-        if (derefUnit) {
-            quat = dq;
-            qsrc = "deref";
-        } else if (inlineUnit) {
-            quat = iq;
-            qsrc = "inline";
-        } else if (derefRead) {
-            quat = dq;
-            qsrc = "deref(nonunit)";
-        } else if (inlineRead) {
-            quat = iq;
-            qsrc = "inline(nonunit)";
+        for (int k = 0; k < nobj; k++) {
+            if (gStopRequested.load()) {
+                free(objs);
+                free(hits);
+                [self logLine:@"scan stopped"];
+                return;
+            }
+
+            size_t want = o[k].level == 0 ? HUNT_L0_SIZE : HUNT_LN_SIZE;
+            memset(buf, 0, sizeof(buf));
+            size_t have = hunt_read_obj(task, o[k].addr, buf, want);
+
+            [self vlogLine:@"OBJ[%d] lvl=%d %s 0x%llx%s", k, o[k].level, o[k].path,
+                        (unsigned long long)o[k].addr,
+                        have ? "" : "  <unreadable>"];
+            if (have == 0)
+                continue;
+
+            int got = hunt_object(buf, have, k, h + hc, HUNT_HITS_PER_CAND - hc);
+            hc += got;
         }
 
-        float qlen = sqrtf(quat.x * quat.x + quat.y * quat.y +
-                           quat.z * quat.z + quat.w * quat.w);
+        hitCount[s] = hc;
+        totalHits += hc;
 
-        /* pos_a: V+0x28 -> +0x18 -> vec3 at +0xD4. Every hop is logged. */
-        uint64_t h0 = 0;
-        bool h0ok = mr_read64(task, v + 0x28, &h0) && h0 != 0;
+        [self vlogLine:@"cand[%d] V=0x%llx objs=%d hits=%d", sel[s], v, nobj, hc];
+    }
 
-        uint64_t h1 = 0;
-        bool h1ok = h0ok && mr_read64(task, h0 + 0x18, &h1) && h1 != 0;
+    /* --- differential + screen output ------------------------------------ */
+    BOOL capped = totalHits > SCREEN_HIT_LIMIT;
+    NSMutableDictionary *prevCache = _hitCache ?: [NSMutableDictionary dictionary];
+    NSMutableDictionary *newCache = [NSMutableDictionary dictionaryWithCapacity:(NSUInteger)totalHits];
 
-        mr_vec3 posA;
-        memset(&posA, 0, sizeof(posA));
-        bool vecOk = h1ok && mr_read_vec3(task, h1 + 0xD4, &posA);
-        bool rangeOk = vecOk && diag_vec3_in_range(posA);
+    int nNew = 0;
+    int nSame = 0;
+    int nChanged = 0;
+    int shown = 0;
+    int totalQuat = 0;
+    int totalPos = 0;
+    int totalInt = 0;
 
-        /* pos_b: V+0x30 -> +0x40 -> four vec3s. */
-        uint64_t b = 0;
-        bool bok = mr_read64(task, v + 0x30, &b) && b != 0;
+    for (int s = 0; s < nsel; s++) {
+        uint64_t v = candidates[sel[s]].v;
+        hunt_obj *o = objs + (size_t)s * HUNT_OBJ_BUDGET;
+        hunt_hit *h = hits + (size_t)s * HUNT_HITS_PER_CAND;
+        int hc = hitCount[s];
 
-        uint64_t bp = 0;
-        bool bpok = bok && mr_read64(task, b + 0x40, &bp) && bp != 0;
+        int cq = 0, cp = 0, ci = 0;
+        for (int k = 0; k < hc; k++) {
+            if (h[k].kind == HUNT_QUAT)
+                cq++;
+            else if (h[k].kind == HUNT_POS)
+                cp++;
+            else
+                ci++;
+        }
+        totalQuat += cq;
+        totalPos += cp;
+        totalInt += ci;
 
-        /* --- verbose detail, file only --- */
-        [self vlogLine:@"cand[%d] %s @ 0x%llx config_link=%d", i,
-                   rangeOk ? "ACCEPT" : "REJECT", v, (int)candidates[i].config_link];
-        [self vlogLine:@"  read64(V)       = 0x%llx", rd64(task, v)];
-        [self vlogLine:@"  read64(V+0xC0)  = 0x%llx", quatPtr];
-        [self vlogLine:@"  quat            = (%.4f, %.4f, %.4f, %.4f) |q|=%.4f src=%s",
-                    quat.x, quat.y, quat.z, quat.w, qlen, qsrc];
-        [self vlogLine:@"  pos_a hop0      = read64(V+0x28)    = 0x%llx%s",
-                    h0, h0ok ? "" : "  <failed>"];
-        [self vlogLine:@"  pos_a hop1      = read64(hop0+0x18) = 0x%llx%s",
-                    h1, h1ok ? "" : "  <failed>"];
-        [self vlogLine:@"  pos_a xyz       = @hop1+0xD4        = (%.2f, %.2f, %.2f)%s",
-                    posA.x, posA.y, posA.z, vecOk ? "" : "  <failed>"];
-        [self vlogLine:@"  pos_b hop0      = read64(V+0x30)    = 0x%llx%s",
-                    b, bok ? "" : "  <failed>"];
-        [self vlogLine:@"  pos_b hop1      = read64(hop0+0x40) = 0x%llx%s",
-                    bp, bpok ? "" : "  <failed>"];
+        /* Differential: compare each hit against the previous scan's value. */
+        for (int k = 0; k < hc; k++) {
+            hunt_hit *p = &h[k];
+            NSString *key = [NSString stringWithFormat:@"%s|%d|%u",
+                             o[p->obj].path, p->kind, (unsigned)p->off];
+            NSString *oldText = prevCache[key];
+            NSString *newText = [NSString stringWithUTF8String:p->text];
 
-        /* --- compact screen line --- */
-        [self logLine:@"cand[%d] V=0x%llx cfg=%d |q|=%.4f pos_a=(%.2f, %.2f, %.2f)",
-                   i, v, (int)candidates[i].config_link, qlen, posA.x, posA.y, posA.z];
+            if (!oldText) {
+                p->diff = DIFF_NEW;
+                p->tail[0] = '\0';
+                nNew++;
+            } else if ([oldText isEqualToString:newText]) {
+                p->diff = DIFF_SAME;
+                snprintf(p->tail, sizeof(p->tail), " SAME");
+                nSame++;
+            } else {
+                p->diff = DIFF_CHANGED;
+                snprintf(p->tail, sizeof(p->tail), " CHANGED (%s -> %s)",
+                         [oldText UTF8String], p->text);
+                nChanged++;
+            }
+            newCache[key] = newText;
+        }
 
-        if (rangeOk) {
-            accepted++;
-            acceptedFlags[i] = true;
+        int budget = capped ? ((candidates[sel[s]].config_link || shown == 0) ?
+                               SCREEN_HIT_LIMIT : 0) : hc;
+        int candShown = 0;
 
-            mr_vec3 posB;
-            memset(&posB, 0, sizeof(posB));
-            bool b0ok = bpok && mr_read_vec3(task, bp + 0x10, &posB);
-            [self vlogLine:@"  pos_b0 xyz      = @hop1+0x10        = (%.2f, %.2f, %.2f)%s",
-                        posB.x, posB.y, posB.z, b0ok ? "" : "  <failed>"];
+        [self logLine:@"cand[%d] V=0x%llx cfg=%d objs=%d hits=%d q:%d p:%d i:%d",
+                   sel[s], v, (int)candidates[sel[s]].config_link,
+                   objCount[s], hc, cq, cp, ci];
 
-            memset(&posB, 0, sizeof(posB));
-            bool b1ok = bpok && mr_read_vec3(task, bp + 0x1C, &posB);
-            [self vlogLine:@"  pos_b1 xyz      = @hop1+0x1C        = (%.2f, %.2f, %.2f)%s",
-                        posB.x, posB.y, posB.z, b1ok ? "" : "  <failed>"];
+        /* CHANGED first, then SAME, then never-seen: the moving fields are the
+           interesting ones when the screen is truncated. */
+        static const int order[3] = { DIFF_CHANGED, DIFF_SAME, DIFF_NEW };
+        for (int pass = 0; pass < 3; pass++) {
+            for (int k = 0; k < hc; k++) {
+                if (h[k].diff != order[pass])
+                    continue;
 
-            memset(&posB, 0, sizeof(posB));
-            bool b2ok = bpok && mr_read_vec3(task, bp + 0x2C, &posB);
-            [self vlogLine:@"  pos_b2 xyz      = @hop1+0x2C        = (%.2f, %.2f, %.2f)%s",
-                        posB.x, posB.y, posB.z, b2ok ? "" : "  <failed>"];
-
-            memset(&posB, 0, sizeof(posB));
-            bool b3ok = bpok && mr_read_vec3(task, bp + 0x38, &posB);
-            [self vlogLine:@"  pos_b3 xyz      = @hop1+0x38        = (%.2f, %.2f, %.2f)%s",
-                        posB.x, posB.y, posB.z, b3ok ? "" : "  <failed>"];
-
-            [self vlogLine:@"  self            = %d", (int)rd8(task, v + 0x128)];
-            [self vlogLine:@"  td5878 i0/i1/i2 = %d / %d / %d",
-                        (int)rd32(task, b + 0x10), (int)rd32(task, b + 0x14),
-                        (int)rd32(task, b + 0x18)];
-        } else {
-            int nb = vecOk ? 1 : 0;
-            nm_add(&nm[nb], v);
-
-            if (dumpedRejects < RAW_DUMP_LIMIT) {
-                dumpedRejects++;
-                [self dumpCandidateRaw:task v:v index:i reason:nmNames[nb]];
+                NSString *line = [self hitLine:&h[k] objs:o];
+                if (candShown < budget && (!capped || shown < SCREEN_HIT_LIMIT)) {
+                    [self logLine:@"%@", line];
+                    candShown++;
+                    shown++;
+                } else {
+                    [self vlogLine:@"%@", line];
+                }
             }
         }
+
+        if (capped && candShown < hc)
+            [self logLine:@"  ... %d more hit(s) for this candidate in diag_scan.log",
+                       hc - candShown];
     }
 
-    /* Near-miss counters on screen; the example addresses stay in the file. */
-    [self logLine:@"rejected: %s = %llu", nmNames[0], nm[0].total];
-    [self logLine:@"rejected: %s = %llu", nmNames[1], nm[1].total];
-    for (int k = 0; k < 2; k++)
-        [self logNearMiss:[NSString stringWithUTF8String:nmNames[k]] bucket:&nm[k]];
+    _hitCache = newCache;
 
-    /* Ground truth dumps: the config_link=1 instance (whatever its acceptance
-       state), then up to three accepted heap instances. */
-    int cfgDumped = 0;
-    int heapDumps = 0;
+    [self logLine:@"hunt complete: %d objects / %d quat / %d pos / %d int100",
+               totalObjs, totalQuat, totalPos, totalInt];
+    [self vlogLine:@"diff: %d new / %d same / %d changed (previous keys %lu)",
+                nNew, nSame, nChanged, (unsigned long)prevCache.count];
 
-    for (int i = 0; i < count; i++) {
-        if (candidates[i].config_link && cfgDumped < 1) {
-            cfgDumped = 1;
-            [self dumpInstance:task v:candidates[i].v index:i];
-            [self followPointers:task v:candidates[i].v];
-        } else if (acceptedFlags[i] && candidates[i].v > ctx.uf_base && heapDumps < HEAP_DUMP_LIMIT) {
-            heapDumps++;
-            [self dumpInstance:task v:candidates[i].v index:i];
-        }
-    }
+    free(objs);
+    free(hits);
 
-    [self logLine:@"scan complete: %d accepted / %d candidates", accepted, count];
     diag_log("diag: scan complete");
 }
 
