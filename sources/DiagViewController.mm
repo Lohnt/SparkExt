@@ -17,6 +17,8 @@
 #define SCAN_CHUNK_SIZE (1u << 20)
 #define NEAR_MISS_EXAMPLES 10
 #define RAW_DUMP_LIMIT 10
+#define CLASS_REGION_RADIUS 0x100000ULL
+#define INSTANCE_DUMP_SIZE 0x148
 
 /* Set from the main thread by the STOP button; polled by every loop. */
 static std::atomic<bool> gStopRequested(false);
@@ -39,6 +41,7 @@ typedef struct {
     uint64_t bytes_scanned;
     uint64_t k1779_hits;
     uint64_t config_link_hits;
+    uint64_t class_self_hits;
     double   elapsed;
 } scan_report;
 
@@ -77,6 +80,11 @@ static uint8_t rd8(mach_port_t task, uint64_t addr)
     return v;
 }
 
+static uint64_t dist64(uint64_t a, uint64_t b)
+{
+    return a > b ? a - b : b - a;
+}
+
 /* A position is plausible if it is finite and inside the playable world box. */
 static bool diag_vec3_in_range(mr_vec3 v)
 {
@@ -109,7 +117,8 @@ static bool diag_sleep_checked(double seconds)
 /* Returns the number of candidates found, or -1 if a stop was requested.
    Fills *rep with coverage statistics even on the stopped/early paths. */
 static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
-                           cand_t *out, int maxout, scan_report *rep)
+                           uint64_t def_table, cand_t *out, int maxout,
+                           scan_report *rep)
 {
     int found = 0;
     vm_address_t addr = 0;
@@ -183,6 +192,16 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
                         rep->k1779_hits++;
 
                         uint64_t candidate = cursor + off;
+
+                        /* A word inside Il2CppClass metadata can contain the
+                           class pointer itself; those are not game objects. */
+                        if (rd64(task, candidate) == k1779 &&
+                            (dist64(candidate, k1779) <= CLASS_REGION_RADIUS ||
+                             dist64(candidate, def_table) <= CLASS_REGION_RADIUS)) {
+                            rep->class_self_hits++;
+                            continue;
+                        }
+
                         uint64_t link = rd64(task, candidate + 0x18);
                         uint8_t cfg = (link != 0 && rd64(task, link) == k7301) ? 1 : 0;
                         if (cfg)
@@ -237,6 +256,7 @@ stopped:
 - (void)logLine:(NSString *)fmt, ...;
 - (void)logNearMiss:(NSString *)reason bucket:(const nm_bucket *)b;
 - (void)dumpCandidateRaw:(mach_port_t)task v:(uint64_t)v index:(int)idx reason:(const char *)reason;
+- (void)dumpInstance:(mach_port_t)task v:(uint64_t)v index:(int)idx;
 - (void)reRun;
 - (void)rescan;
 - (void)stopScan;
@@ -382,6 +402,44 @@ stopped:
             [self logLine:@"  V+0x%02llx     = 0x%llx -> read64 = 0x%llx",
                        offs[k], p, rd64(task, p)];
         }
+    }
+}
+
+/* Ground truth: 0x148 bytes of the instance, 16 u64 per line, with the same
+   words below as float32 (x y z w ...). */
+- (void)dumpInstance:(mach_port_t)task v:(uint64_t)v index:(int)idx
+{
+    unsigned char buf[INSTANCE_DUMP_SIZE];
+    memset(buf, 0, sizeof(buf));
+
+    if (!mr_read(task, v, buf, sizeof(buf))) {
+        [self logLine:@"DUMP cand[%d] V=0x%llx <unreadable>", idx, v];
+        return;
+    }
+
+    [self logLine:@"DUMP cand[%d] V=0x%llx", idx, v];
+
+    for (size_t off = 0; off < INSTANCE_DUMP_SIZE; off += 128) {
+        size_t avail = INSTANCE_DUMP_SIZE - off;
+        size_t words = (avail < 128 ? avail : 128) / 8;
+
+        NSMutableString *hexLine = [NSMutableString stringWithFormat:@"  +0x%03zx  ", off];
+        NSMutableString *f32Line = [NSMutableString stringWithString:@"  f32       "];
+
+        for (size_t w = 0; w < words; w++) {
+            uint64_t word = 0;
+            memcpy(&word, buf + off + w * 8, sizeof(word));
+            [hexLine appendFormat:@"0x%016llx ", (unsigned long long)word];
+
+            float f[2];
+            memcpy(f, buf + off + w * 8, sizeof(f));
+            if (w % 2 == 0)
+                [f32Line appendString:@" "];
+            [f32Line appendFormat:@"%10.3f %10.3f ", f[0], f[1]];
+        }
+
+        [self logLine:@"%@", hexLine];
+        [self logLine:@"%@", f32Line];
     }
 }
 
@@ -536,7 +594,8 @@ stopped:
     cand_t candidates[MAX_CANDIDATES];
     scan_report rep;
     CFAbsoluteTime tScan = CFAbsoluteTimeGetCurrent();
-    int count = scan_candidates(task, ctx.k1779, ctx.k7301, candidates, MAX_CANDIDATES, &rep);
+    int count = scan_candidates(task, ctx.k1779, ctx.k7301, ctx.def_table,
+                                candidates, MAX_CANDIDATES, &rep);
     double scanWall = CFAbsoluteTimeGetCurrent() - tScan;
     diag_log("diag: scan returned");
 
@@ -552,6 +611,7 @@ stopped:
     [self logLine:@"  elapsed         = %.2f s (wall %.2f s)", rep.elapsed, scanWall];
     [self logLine:@"  k1779 hits      = %llu (config_link hits %llu)",
                rep.k1779_hits, rep.config_link_hits];
+    [self logLine:@"  class self-hits = %llu (excluded)", rep.class_self_hits];
     [self logLine:@"  candidates kept = %d (cap %d)", count < 0 ? 0 : count, MAX_CANDIDATES];
 
     if (count < 0) {
@@ -560,17 +620,17 @@ stopped:
         return;
     }
 
-    static const char *nmNames[4] = {
-        "+0xC0 deref failed",
-        "all-zero quat (dead)",
-        "quat not unit-norm",
+    static const char *nmNames[2] = {
+        "pos_a chain unresolved",
         "pos out of range",
     };
-    nm_bucket nm[4];
+    nm_bucket nm[2];
     memset(nm, 0, sizeof(nm));
 
     int accepted = 0;
-    int dumped = 0;
+    int dumpedRejects = 0;
+    int dumpedConfig = 0;
+    int dumpedHeap = 0;
 
     for (int i = 0; i < count; i++) {
         if (gStopRequested.load()) {
@@ -579,12 +639,9 @@ stopped:
         }
 
         uint64_t v = candidates[i].v;
-        int nb = -1;
-        const char *reason = NULL;
 
-        /* Quat path 1: read64(V+0xC0) -> +0x78 (pointer to a rotation).
-           Quat path 2: the 16 bytes at V+0xC0 read directly as a quat.
-           Whichever yields a unit quaternion wins; the source is reported. */
+        /* Quat is informational now: both paths are tried, the winner is
+           reported, but a bad quat never rejects a candidate. */
         uint64_t quatPtr = 0;
         mr_quat quat;
         memset(&quat, 0, sizeof(quat));
@@ -607,92 +664,107 @@ stopped:
         } else if (inlineUnit) {
             quat = iq;
             qsrc = "inline";
-        } else if (quatPtr == 0 || !derefRead) {
-            nb = 0;
-            reason = nmNames[0];
-        } else if (dq.x == 0.0f && dq.y == 0.0f && dq.z == 0.0f && dq.w == 0.0f &&
-                   iq.x == 0.0f && iq.y == 0.0f && iq.z == 0.0f && iq.w == 0.0f) {
-            nb = 1;
-            reason = nmNames[1];
-        } else {
-            nb = 2;
-            reason = nmNames[2];
+        } else if (derefRead) {
+            quat = dq;
+            qsrc = "deref(nonunit)";
+        } else if (inlineRead) {
+            quat = iq;
+            qsrc = "inline(nonunit)";
         }
-
-        uint64_t h0 = 0, h1 = 0;
-        mr_vec3 posA;
-        memset(&posA, 0, sizeof(posA));
-
-        if (!reason) {
-            h0 = rd64(task, v + 0x28);
-            h1 = h0 ? rd64(task, h0 + 0x18) : 0;
-            if (!h1 || !mr_read_vec3(task, h1 + 0xD4, &posA) || !diag_vec3_in_range(posA)) {
-                nb = 3;
-                reason = nmNames[3];
-            }
-        }
-
-        if (reason) {
-            nm_add(&nm[nb], v);
-            if (dumped < RAW_DUMP_LIMIT) {
-                dumped++;
-                [self dumpCandidateRaw:task v:v index:i reason:reason];
-            }
-            continue;
-        }
-
-        /* ---- accepted: live actor, print the full detail block ---- */
-        accepted++;
-
-        uint64_t b = rd64(task, v + 0x30);
-        uint64_t bp = rd64(task, b + 0x40);
 
         float qlen = sqrtf(quat.x * quat.x + quat.y * quat.y +
                            quat.z * quat.z + quat.w * quat.w);
 
-        [self logLine:@"candidate[%d] ACCEPT @ 0x%llx", i, v];
-        [self logLine:@"  V               = 0x%llx", v];
+        /* pos_a: V+0x28 -> +0x18 -> vec3 at +0xD4. Every hop is logged. */
+        uint64_t h0 = 0;
+        bool h0ok = mr_read64(task, v + 0x28, &h0) && h0 != 0;
+
+        uint64_t h1 = 0;
+        bool h1ok = h0ok && mr_read64(task, h0 + 0x18, &h1) && h1 != 0;
+
+        mr_vec3 posA;
+        memset(&posA, 0, sizeof(posA));
+        bool vecOk = h1ok && mr_read_vec3(task, h1 + 0xD4, &posA);
+        bool rangeOk = vecOk && diag_vec3_in_range(posA);
+
+        /* pos_b: V+0x30 -> +0x40 -> four vec3s. */
+        uint64_t b = 0;
+        bool bok = mr_read64(task, v + 0x30, &b) && b != 0;
+
+        uint64_t bp = 0;
+        bool bpok = bok && mr_read64(task, b + 0x40, &bp) && bp != 0;
+
+        const char *tag = rangeOk ? "ACCEPT" : "REJECT";
+        [self logLine:@"cand[%d] %s @ 0x%llx  config_link=%d", i, tag, v,
+                   (int)candidates[i].config_link];
         [self logLine:@"  read64(V)       = 0x%llx", rd64(task, v)];
-        [self logLine:@"  config_link     = %d", (int)candidates[i].config_link];
         [self logLine:@"  read64(V+0xC0)  = 0x%llx", quatPtr];
-        [self logLine:@"  quat_ptr        = 0x%llx", quatPtr];
         [self logLine:@"  quat            = (%.4f, %.4f, %.4f, %.4f) |q|=%.4f src=%s",
                    quat.x, quat.y, quat.z, quat.w, qlen, qsrc];
-        [self logLine:@"  pos_a hop0      = read64(V+0x28)    = 0x%llx", h0];
-        [self logLine:@"  pos_a hop1      = read64(hop0+0x18) = 0x%llx", h1];
-        [self logLine:@"  pos_a xyz       = @hop1+0xD4        = (%.2f, %.2f, %.2f)",
-                   posA.x, posA.y, posA.z];
-        [self logLine:@"  pos_b hop0      = read64(V+0x30)    = 0x%llx", b];
-        [self logLine:@"  pos_b hop1      = read64(hop0+0x40) = 0x%llx", bp];
+        [self logLine:@"  pos_a hop0      = read64(V+0x28)    = 0x%llx%s",
+                   h0, h0ok ? "" : "  <failed>"];
+        [self logLine:@"  pos_a hop1      = read64(hop0+0x18) = 0x%llx%s",
+                   h1, h1ok ? "" : "  <failed>"];
+        [self logLine:@"  pos_a xyz       = @hop1+0xD4        = (%.2f, %.2f, %.2f)%s",
+                   posA.x, posA.y, posA.z, vecOk ? "" : "  <failed>"];
+        [self logLine:@"  pos_b hop0      = read64(V+0x30)    = 0x%llx%s",
+                   b, bok ? "" : "  <failed>"];
+        [self logLine:@"  pos_b hop1      = read64(hop0+0x40) = 0x%llx%s",
+                   bp, bpok ? "" : "  <failed>"];
 
-        mr_vec3 posB;
-        memset(&posB, 0, sizeof(posB));
-        mr_read_vec3(task, bp + 0x10, &posB);
-        [self logLine:@"  pos_b0 xyz      = @hop1+0x10        = (%.2f, %.2f, %.2f)",
-                   posB.x, posB.y, posB.z];
+        if (rangeOk) {
+            accepted++;
 
-        memset(&posB, 0, sizeof(posB));
-        mr_read_vec3(task, bp + 0x1C, &posB);
-        [self logLine:@"  pos_b1 xyz      = @hop1+0x1C        = (%.2f, %.2f, %.2f)",
-                   posB.x, posB.y, posB.z];
+            mr_vec3 posB;
+            memset(&posB, 0, sizeof(posB));
+            bool b0ok = bpok && mr_read_vec3(task, bp + 0x10, &posB);
+            [self logLine:@"  pos_b0 xyz      = @hop1+0x10        = (%.2f, %.2f, %.2f)%s",
+                       posB.x, posB.y, posB.z, b0ok ? "" : "  <failed>"];
 
-        memset(&posB, 0, sizeof(posB));
-        mr_read_vec3(task, bp + 0x2C, &posB);
-        [self logLine:@"  pos_b2 xyz      = @hop1+0x2C        = (%.2f, %.2f, %.2f)",
-                   posB.x, posB.y, posB.z];
+            memset(&posB, 0, sizeof(posB));
+            bool b1ok = bpok && mr_read_vec3(task, bp + 0x1C, &posB);
+            [self logLine:@"  pos_b1 xyz      = @hop1+0x1C        = (%.2f, %.2f, %.2f)%s",
+                       posB.x, posB.y, posB.z, b1ok ? "" : "  <failed>"];
 
-        memset(&posB, 0, sizeof(posB));
-        mr_read_vec3(task, bp + 0x38, &posB);
-        [self logLine:@"  pos_b3 xyz      = @hop1+0x38        = (%.2f, %.2f, %.2f)",
-                   posB.x, posB.y, posB.z];
+            memset(&posB, 0, sizeof(posB));
+            bool b2ok = bpok && mr_read_vec3(task, bp + 0x2C, &posB);
+            [self logLine:@"  pos_b2 xyz      = @hop1+0x2C        = (%.2f, %.2f, %.2f)%s",
+                       posB.x, posB.y, posB.z, b2ok ? "" : "  <failed>"];
 
-        [self logLine:@"  self            = %d", (int)rd8(task, v + 0x128)];
-        [self logLine:@"  td5878 i0/i1/i2 = %d / %d / %d",
-                   (int)rd32(task, b + 0x10), (int)rd32(task, b + 0x14), (int)rd32(task, b + 0x18)];
+            memset(&posB, 0, sizeof(posB));
+            bool b3ok = bpok && mr_read_vec3(task, bp + 0x38, &posB);
+            [self logLine:@"  pos_b3 xyz      = @hop1+0x38        = (%.2f, %.2f, %.2f)%s",
+                       posB.x, posB.y, posB.z, b3ok ? "" : "  <failed>"];
+
+            [self logLine:@"  self            = %d", (int)rd8(task, v + 0x128)];
+            [self logLine:@"  td5878 i0/i1/i2 = %d / %d / %d",
+                       (int)rd32(task, b + 0x10), (int)rd32(task, b + 0x14), (int)rd32(task, b + 0x18)];
+        } else {
+            int nb = vecOk ? 1 : 0;
+            nm_add(&nm[nb], v);
+
+            if (dumpedRejects < RAW_DUMP_LIMIT) {
+                dumpedRejects++;
+                [self dumpCandidateRaw:task v:v index:i reason:nmNames[nb]];
+            }
+        }
+
+        /* Ground truth dumps: the config_link=1 instance (whatever its
+           acceptance state), then up to two accepted heap instances. */
+        BOOL wantDump = NO;
+        if (candidates[i].config_link && dumpedConfig < 1) {
+            dumpedConfig++;
+            wantDump = YES;
+        } else if (rangeOk && v > ctx.uf_base && dumpedHeap < 2) {
+            dumpedHeap++;
+            wantDump = YES;
+        }
+        if (wantDump)
+            [self dumpInstance:task v:v index:i];
     }
 
     [self logLine:@"--- near-misses ---"];
-    for (int k = 0; k < 4; k++)
+    for (int k = 0; k < 2; k++)
         [self logNearMiss:[NSString stringWithUTF8String:nmNames[k]] bucket:&nm[k]];
 
     [self logLine:@"scan complete: %d accepted / %d candidates", accepted, count];
