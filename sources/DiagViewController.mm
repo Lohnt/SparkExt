@@ -50,6 +50,16 @@
 #define VIEW_SPINE_STRIDE   0x58ULL
 #define VIEW_SPINE_BYTES    0x58
 
+/* --- round 23: T block, MAT2, actor census, table snapshot -------------- */
+#define T_ROWS_FROM         0x0f0
+#define T_ROWS_TO           0x180
+#define TABLE_OFF_FIELD     0xb0     /* T -> table object (0x12b059000) */
+#define TABLE_FALLBACK      0x12b059000ULL
+#define TABLE_SCAN_SIZE     0x300
+#define TABLE_SCREEN_CHG    20
+#define ACTOR_SCAN_SIZE     0x148
+#define ACTOR_STRIDE        0x58ULL
+
 /* --- il2cpp class metadata ---------------------------------------------- */
 #define ACTOR_NAME_EXPECT  "O7D1D7DB39"
 #define TD_UNITY_TRANSFORM 13036ULL
@@ -522,7 +532,9 @@ enum {
     VIEW_TAG_DIR4_START = 1 << 3,
     VIEW_TAG_DIR_MEMBER = 1 << 4,
     VIEW_TAG_MAT_START  = 1 << 5,
-    VIEW_TAG_MAT_MEMBER = 1 << 6
+    VIEW_TAG_MAT_MEMBER = 1 << 6,
+    VIEW_TAG_MAT2_POS   = 1 << 7,   /* row 3 == (0,0,1,0) */
+    VIEW_TAG_MAT2_NEG   = 1 << 8    /* row 3 == (0,0,-1,0) */
 };
 
 /* One chunk of VIEW-phase memory: the view state object (T), the config object
@@ -538,6 +550,7 @@ typedef struct {
     int pos;
     int dir;
     int mat;
+    int mat2;
     int changed;
     int added;
 } view_stats;
@@ -592,6 +605,27 @@ static bool view_mat_ok(const float *m)
     return false;
 }
 
+/* Perspective projection signature: row 3 is (0,0,-1,0) or (0,0,1,0).
+   Returns +1/-1 for the sign on the Z row and 0 when it does not match. */
+static int view_proj_ok(const float *m)
+{
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(m[i]))
+            return 0;
+    }
+
+    if (!(m[12] == 0.0f && m[13] == 0.0f && m[15] == 0.0f))
+        return 0;
+    if (m[14] != -1.0f && m[14] != 1.0f)
+        return 0;
+
+    for (int i = 0; i < 12; i++) {
+        if (m[i] != 0.0f)
+            return m[14] > 0.0f ? 1 : -1;
+    }
+    return 0;
+}
+
 static const char *view_tag_name(uint8_t tag)
 {
     if (tag & VIEW_TAG_POS_START)
@@ -602,6 +636,10 @@ static const char *view_tag_name(uint8_t tag)
         return "DIR";
     if (tag & VIEW_TAG_MAT_START)
         return "MAT";
+    if (tag & VIEW_TAG_MAT2_POS)
+        return "MAT2+";
+    if (tag & VIEW_TAG_MAT2_NEG)
+        return "MAT2-";
     if (tag & VIEW_TAG_POS_MEMBER)
         return "POS*";
     if (tag & VIEW_TAG_DIR_MEMBER)
@@ -923,6 +961,12 @@ stopped:
        absolute slot address, and the V picked as the local player's actor. */
     NSMutableDictionary *_viewSlots;
     uint64_t _localV;
+
+    /* Round 23: per-actor slot cache (V+0x00..0x148), the dedicated cache for
+       the T+0xb0 table, and a scan counter for the frozen-table marker. */
+    NSMutableDictionary *_actorSlots;
+    NSMutableDictionary *_tableSlots;
+    int _scanCount;
 }
 
 - (void)appendLog:(NSString *)line;
@@ -954,8 +998,20 @@ stopped:
                   next:(NSMutableDictionary *)next
                  probe:(uint64_t)probe
                  stats:(view_stats *)vs
-            screenLeft:(int *)left;
+            screenLeft:(int *)left
+                  skip:(uint64_t)skipAddr;
 - (void)viewEmit:(NSString *)line screenLeft:(int *)left;
+- (void)viewTBlockTask:(mach_port_t)task t:(uint64_t)tObj;
+- (void)viewTableTask:(mach_port_t)task
+                 base:(uint64_t)base
+                 meta:(uint64_t)meta
+                 prev:(NSDictionary *)prev
+                 next:(NSMutableDictionary *)next
+                  src:(const char *)src;
+- (void)viewDumpRows:(const uint8_t *)raw have:(size_t)have label:(const char *)label;
+- (void)runActorCensusTask:(mach_port_t)task
+                candidates:(const cand_t *)cands
+                     count:(int)count;
 
 @end
 
@@ -972,6 +1028,9 @@ stopped:
     _hitCache = [NSMutableDictionary dictionary];
     _viewSlots = [NSMutableDictionary dictionary];
     _localV = 0;
+    _actorSlots = [NSMutableDictionary dictionary];
+    _tableSlots = [NSMutableDictionary dictionary];
+    _scanCount = 0;
 
     self.view.backgroundColor = [UIColor blackColor];
 
@@ -1298,6 +1357,7 @@ stopped:
     }
 
     [self logLine:@"scanning heap..."];
+    _scanCount++;
 
     cand_t candidates[MAX_CANDIDATES];
     scan_report rep;
@@ -1645,6 +1705,9 @@ stopped:
                        candChg:candChg];
     }
 
+    if (!gStopRequested.load())
+        [self runActorCensusTask:task candidates:candidates count:count];
+
     free(objs);
     free(hits);
     free(buf);
@@ -1707,6 +1770,19 @@ stopped:
                 localIdx, (unsigned long long)vLocal, candChg[localIdx],
                 (unsigned long long)tObj, (unsigned long long)cfgObj];
 
+    /* Item 1: the T block (screen band, file dump, every unit vec3). */
+    [self viewTBlockTask:task t:tObj];
+
+    /* Item 4: the table hanging off T+0xb0 (0x12b059000 in run #22). */
+    uint64_t tableObj = tObj ? rd64(task, tObj + TABLE_OFF_FIELD) : 0;
+    const char *tableSrc = "T+0xb0";
+    if (!tableObj) {
+        tableObj = TABLE_FALLBACK;
+        tableSrc = "literal";
+    }
+    uint64_t tableSkip = (tableObj && tableObj != tObj && tableObj != cfgObj)
+                         ? tableObj : 0;
+
     view_region *regs = (view_region *)calloc(VIEW_REGION_MAX, sizeof(view_region));
     if (!regs) {
         [self logLine:@"view: out of memory"];
@@ -1743,8 +1819,15 @@ stopped:
             break;
         }
         [self viewScanRegion:&regs[i] task:task prev:prev next:next
-                        probe:tObj stats:&vs screenLeft:&left];
+                        probe:tObj stats:&vs screenLeft:&left skip:tableSkip];
     }
+
+    NSDictionary *tprev = _tableSlots ?: [NSDictionary dictionary];
+    NSMutableDictionary *tnext = [NSMutableDictionary dictionaryWithCapacity:1024];
+    [self viewTableTask:task base:tableObj meta:ctx->metadata_base
+                   prev:tprev next:tnext src:tableSrc];
+    if (!stopped)
+        _tableSlots = tnext;
 
     /* On an aborted pass keep the old snapshot; a partial one would make every
        untouched slot look NEW next time. */
@@ -1756,7 +1839,7 @@ stopped:
 
     [self logLine:@"view: %d slots / %d pos / %d dir / %d mat (%d changed)",
                vs.slots, vs.pos, vs.dir, vs.mat, vs.changed];
-    [self vlogLine:@"view new slots = %d", vs.added];
+    [self vlogLine:@"view mat2 = %d / new slots = %d", vs.mat2, vs.added];
 
     if (stopped)
         [self logLine:@"scan stopped"];
@@ -1865,10 +1948,18 @@ stopped:
                  probe:(uint64_t)probe
                  stats:(view_stats *)vs
             screenLeft:(int *)left
+                  skip:(uint64_t)skipAddr
 {
     size_t want = reg->len;
     if (want < 16)
         return;
+
+    /* The T+0xb0 table gets its own snapshot and its own screen block. */
+    if (skipAddr && reg->addr == skipAddr) {
+        [self vlogLine:@"VIEW REG %s base=0x%llx skipped (TABLE block)",
+                    reg->path, (unsigned long long)reg->addr];
+        return;
+    }
 
     uint8_t *raw = (uint8_t *)malloc(want);
     float *fv = (float *)malloc(want);
@@ -1930,6 +2021,21 @@ stopped:
             tag[i + k] |= VIEW_TAG_MAT_MEMBER;
     }
 
+    /* MAT2: perspective projection signature, row 3 is (0,0,+/-1,0). */
+    int rmat2 = 0;
+
+    for (int i = 0; i + 16 <= nslots; i++) {
+        if (((reg->addr + (uint64_t)i * 4) & 0xFULL) != 0)
+            continue;
+        int sign = view_proj_ok(fv + i);
+        if (sign == 0)
+            continue;
+        rmat2++;
+        tag[i] |= (sign > 0) ? VIEW_TAG_MAT2_POS : VIEW_TAG_MAT2_NEG;
+        for (int k = 1; k < 16; k++)
+            tag[i + k] |= VIEW_TAG_MAT_MEMBER;
+    }
+
     /* Differential pass: one dictionary lookup per slot, no output yet. */
     int rchg = 0;
 
@@ -1958,11 +2064,12 @@ stopped:
     vs->pos += rpos;
     vs->dir += rdir;
     vs->mat += rmat;
+    vs->mat2 += rmat2;
     vs->changed += rchg;
 
-    [self vlogLine:@"VIEW REG %s base=0x%llx len=0x%zx slots=%d pos=%d dir=%d mat=%d chg=%d",
+    [self vlogLine:@"VIEW REG %s base=0x%llx len=0x%zx slots=%d pos=%d dir=%d mat=%d mat2=%d chg=%d",
                 reg->path, (unsigned long long)reg->addr, have, nslots,
-                rpos, rdir, rmat, rchg];
+                rpos, rdir, rmat, rmat2, rchg];
 
     /* File-only probe of the run #22 anchors: view position and direction. */
     if (probe && reg->addr == probe) {
@@ -1998,24 +2105,41 @@ stopped:
             screenLeft:left];
     }
 
-    /* Emission pass 2: every MAT? block, changed or not, offset order. */
+    /* Emission pass 2: every MAT?/MAT2? block, changed or not, offset order. */
     for (int i = 0; i < nslots; i++) {
         if (gStopRequested.load())
             break;
-        if (!(tag[i] & VIEW_TAG_MAT_START))
+
+        if (tag[i] & VIEW_TAG_MAT_START) {
+            [self viewEmit:[NSString stringWithFormat:
+                            @"VIEW MAT %s +0x%03x  %8.3f %8.3f %8.3f %8.3f | "
+                            @"%8.3f %8.3f %8.3f %8.3f | "
+                            @"%8.3f %8.3f %8.3f %8.3f | "
+                            @"%8.3f %8.3f %8.3f %8.3f",
+                            reg->path, (unsigned)(i * 4),
+                            fv[i + 0], fv[i + 1], fv[i + 2], fv[i + 3],
+                            fv[i + 4], fv[i + 5], fv[i + 6], fv[i + 7],
+                            fv[i + 8], fv[i + 9], fv[i + 10], fv[i + 11],
+                            fv[i + 12], fv[i + 13], fv[i + 14], fv[i + 15]]
+                        screenLeft:left];
+            continue;
+        }
+
+        if (!(tag[i] & (VIEW_TAG_MAT2_POS | VIEW_TAG_MAT2_NEG)))
             continue;
 
-        [self viewEmit:[NSString stringWithFormat:
-                        @"VIEW MAT %s +0x%03x  %8.3f %8.3f %8.3f %8.3f | "
-                        @"%8.3f %8.3f %8.3f %8.3f | "
-                        @"%8.3f %8.3f %8.3f %8.3f | "
-                        @"%8.3f %8.3f %8.3f %8.3f",
-                        reg->path, (unsigned)(i * 4),
-                        fv[i + 0], fv[i + 1], fv[i + 2], fv[i + 3],
-                        fv[i + 4], fv[i + 5], fv[i + 6], fv[i + 7],
-                        fv[i + 8], fv[i + 9], fv[i + 10], fv[i + 11],
-                        fv[i + 12], fv[i + 13], fv[i + 14], fv[i + 15]]
-                    screenLeft:left];
+        /* MAT2 goes to the screen unconditionally: it is the rare projection
+           signature the census needs, so the 60-line budget does not apply. */
+        [self logLine:@"VIEW MAT2 %s +0x%03x  %8.3f %8.3f %8.3f %8.3f | "
+                    @"%8.3f %8.3f %8.3f %8.3f | "
+                    @"%8.3f %8.3f %8.3f %8.3f | "
+                    @"%8.3f %8.3f %8.3f %8.3f  [row3 %s]",
+                    reg->path, (unsigned)(i * 4),
+                    fv[i + 0], fv[i + 1], fv[i + 2], fv[i + 3],
+                    fv[i + 4], fv[i + 5], fv[i + 6], fv[i + 7],
+                    fv[i + 8], fv[i + 9], fv[i + 10], fv[i + 11],
+                    fv[i + 12], fv[i + 13], fv[i + 14], fv[i + 15],
+                    (tag[i] & VIEW_TAG_MAT2_POS) ? "0,0,1,0" : "0,0,-1,0"];
     }
 
     free(raw);
@@ -2033,6 +2157,281 @@ stopped:
     } else {
         [self vlogLine:@"%@", line];
     }
+}
+
+/* Hex + float rows for a raw dump; file only. */
+- (void)viewDumpRows:(const uint8_t *)raw have:(size_t)have label:(const char *)label
+{
+    int nslots = (int)(have / 4);
+
+    for (int row = 0; row + 4 <= nslots; row += 4) {
+        char hex[16 * 3 + 4];
+        size_t hp = 0;
+        hex[0] = '\0';
+        for (int b = 0; b < 16 && hp + 4 < sizeof(hex); b++) {
+            hp += (size_t)snprintf(hex + hp, sizeof(hex) - hp, "%02x ",
+                                   raw[(size_t)row * 4 + b]);
+        }
+
+        float f[4];
+        memcpy(f, raw + (size_t)row * 4, sizeof(f));
+
+        [self vlogLine:@"%s %03x  %-48s | %9.4f %9.4f %9.4f %9.4f",
+                    label, row * 4, hex, f[0], f[1], f[2], f[3]];
+    }
+}
+
+/* Item 1: the T block. Screen shows the +0x0f0..0x180 float rows, the file gets
+   all of 0x000..0x300 as hex+float rows, and every unit-length vec3 in T is
+   printed to both with the following float as w so forward/right/up can be
+   told apart. */
+- (void)viewTBlockTask:(mach_port_t)task t:(uint64_t)tObj
+{
+    if (!tObj)
+        return;
+
+    uint8_t raw[VIEW_SCAN_SIZE];
+    memset(raw, 0, sizeof(raw));
+    size_t have = hunt_read_obj(task, tObj, raw, VIEW_SCAN_SIZE);
+    int nslots = (int)(have / 4);
+
+    [self logLine:@"T block T=0x%llx read=0x%zx slots=%d",
+               (unsigned long long)tObj, have, nslots];
+    if (nslots < 4)
+        return;
+
+    [self viewDumpRows:raw have:have label:"T"];
+
+    float fv[VIEW_SCAN_SIZE / 4];
+    memcpy(fv, raw, (size_t)nslots * sizeof(float));
+
+    for (int off = T_ROWS_FROM; off < T_ROWS_TO; off += 16) {
+        int i = off / 4;
+        if (i + 3 >= nslots)
+            break;
+        [self logLine:@"T+0x%03x  %9.4f %9.4f %9.4f %9.4f",
+                   off, fv[i], fv[i + 1], fv[i + 2], fv[i + 3]];
+    }
+
+    int vecs = 0;
+    for (int i = 0; i + 3 < nslots; i++) {
+        if (!view_dir_ok(fv + i, NULL))
+            continue;
+        vecs++;
+        [self logLine:@"VEC T+0x%03x  (%9.4f,%9.4f,%9.4f, %9.4f)",
+                   i * 4, fv[i], fv[i + 1], fv[i + 2], fv[i + 3]];
+    }
+    [self logLine:@"T vec3 count = %d", vecs];
+}
+
+/* Item 4: snapshot of the table hanging off T+0xb0. Full hex+float dump to the
+   file every scan; the screen gets the changed-slot count and the first 20
+   changes. A zero count from scan 3 on is marked FROZEN. */
+- (void)viewTableTask:(mach_port_t)task
+                 base:(uint64_t)base
+                 meta:(uint64_t)meta
+                 prev:(NSDictionary *)prev
+                 next:(NSMutableDictionary *)next
+                  src:(const char *)src
+{
+    if (!base) {
+        [self logLine:@"table: none (T+0x%02x = 0)", TABLE_OFF_FIELD];
+        return;
+    }
+
+    uint8_t raw[TABLE_SCAN_SIZE];
+    memset(raw, 0, sizeof(raw));
+    size_t have = hunt_read_obj(task, base, raw, TABLE_SCAN_SIZE);
+    int nslots = (int)(have / 4);
+
+    uint64_t cls = 0;
+    char clsName[40];
+    clsName[0] = '\0';
+    if (have >= 8) {
+        memcpy(&cls, raw, sizeof(cls));
+        if (cls >= HUNT_PTR_MIN)
+            class_name_at(task, cls, 0x10, meta, clsName, sizeof(clsName));
+    }
+
+    int chg = 0;
+
+    for (int i = 0; i < nslots; i++) {
+        uint32_t bits = 0;
+        memcpy(&bits, raw + (size_t)i * 4, sizeof(bits));
+
+        NSNumber *key = [NSNumber numberWithUnsignedLongLong:
+                         base + (uint64_t)i * 4];
+        NSNumber *oldNum = prev[key];
+
+        if (oldNum && [oldNum unsignedIntValue] != bits)
+            chg++;
+
+        next[key] = [NSNumber numberWithUnsignedInt:bits];
+    }
+
+    [self logLine:@"table X=0x%llx src=%s read=0x%zx slots=%d class=0x%llx name=%s chg=%d",
+               (unsigned long long)base, src, have, nslots,
+               (unsigned long long)cls, clsName[0] ? clsName : "?", chg];
+
+    [self viewDumpRows:raw have:have label:"TBL"];
+
+    int shown = 0;
+
+    for (int i = 0; i < nslots; i++) {
+        uint32_t bits = 0;
+        memcpy(&bits, raw + (size_t)i * 4, sizeof(bits));
+
+        NSNumber *key = [NSNumber numberWithUnsignedLongLong:
+                         base + (uint64_t)i * 4];
+        NSNumber *oldNum = prev[key];
+        if (!oldNum)
+            continue;
+
+        uint32_t oldBits = [oldNum unsignedIntValue];
+        if (oldBits == bits)
+            continue;
+
+        float oldF = 0.0f;
+        float newF = 0.0f;
+        memcpy(&oldF, &oldBits, sizeof(oldF));
+        memcpy(&newF, &bits, sizeof(newF));
+
+        if (shown < TABLE_SCREEN_CHG) {
+            [self logLine:@"  table chg +0x%03x  %.4f -> %.4f", i * 4, oldF, newF];
+            shown++;
+        } else {
+            [self vlogLine:@"  table chg +0x%03x  %.4f -> %.4f", i * 4, oldF, newF];
+        }
+    }
+
+    if (have == 0) {
+        [self logLine:@"table: unreadable at 0x%llx", (unsigned long long)base];
+    } else if (chg == 0) {
+        if (_scanCount >= 3)
+            [self logLine:@"table: FROZEN (chg=0 in scan %d)", _scanCount];
+        else
+            [self logLine:@"table: chg=0 (scan %d, baseline)", _scanCount];
+    } else if (chg > TABLE_SCREEN_CHG) {
+        [self logLine:@"table: %d more changed slots in diag_scan.log",
+                   chg - TABLE_SCREEN_CHG];
+    }
+}
+
+/* Item 3: census over every K1779 hit. Each actor gets one line (file always,
+   screen when it has changes); its first 0x148 bytes are diffed slot by slot,
+   and the changed slots are listed in the file. */
+- (void)runActorCensusTask:(mach_port_t)task
+                candidates:(const cand_t *)cands
+                     count:(int)count
+{
+    [self logLine:@"--- actor census ---"];
+
+    NSDictionary *prev = _actorSlots ?: [NSDictionary dictionary];
+    NSMutableDictionary *next = [NSMutableDictionary dictionaryWithCapacity:8192];
+
+    int changedActors = 0;
+    int changedSlots = 0;
+    int runMembers = 0;
+    int scanned = 0;
+    bool stopped = false;
+
+    for (int i = 0; i < count; i++) {
+        if (gStopRequested.load()) {
+            stopped = true;
+            break;
+        }
+
+        uint64_t v = cands[i].v;
+        uint8_t raw[ACTOR_SCAN_SIZE];
+        memset(raw, 0, sizeof(raw));
+        size_t have = hunt_read_obj(task, v, raw, sizeof(raw));
+        int nslots = (int)(have / 4);
+        scanned++;
+
+        int inRun = 0;
+        for (int j = 0; j < count; j++) {
+            if (j == i)
+                continue;
+            if (cands[j].v == v + ACTOR_STRIDE ||
+                cands[j].v == v - ACTOR_STRIDE) {
+                inRun = 1;
+                break;
+            }
+        }
+        if (inRun)
+            runMembers++;
+
+        uint32_t t0 = 0, t1 = 0, t2 = 0;
+        uint64_t t5878 = rd64(task, v + 0x30);
+        if (t5878) {
+            mr_read32(task, t5878 + 0x10, &t0);
+            mr_read32(task, t5878 + 0x14, &t1);
+            mr_read32(task, t5878 + 0x18, &t2);
+        }
+
+        uint8_t chgFlags[ACTOR_SCAN_SIZE / 4];
+        memset(chgFlags, 0, sizeof(chgFlags));
+        int chg = 0;
+
+        for (int s = 0; s < nslots; s++) {
+            uint32_t bits = 0;
+            memcpy(&bits, raw + (size_t)s * 4, sizeof(bits));
+
+            NSNumber *key = [NSNumber numberWithUnsignedLongLong:
+                             v + (uint64_t)s * 4];
+            NSNumber *oldNum = prev[key];
+
+            if (oldNum && [oldNum unsignedIntValue] != bits) {
+                chgFlags[s] = 1;
+                chg++;
+            }
+
+            next[key] = [NSNumber numberWithUnsignedInt:bits];
+        }
+
+        NSString *line = [NSString stringWithFormat:
+                          @"actor[%d] V=0x%llx cfg=%d run=%d td5878=(%d,%d,%d) read=0x%zx chg=%d",
+                          i, (unsigned long long)v, (int)cands[i].config_link,
+                          inRun, (int)(int32_t)t0, (int)(int32_t)t1,
+                          (int)(int32_t)t2, have, chg];
+
+        if (chg > 0) {
+            [self logLine:@"%@", line];
+            changedActors++;
+            changedSlots += chg;
+        } else {
+            [self vlogLine:@"%@", line];
+        }
+
+        for (int s = 0; s < nslots; s++) {
+            if (!chgFlags[s])
+                continue;
+
+            uint32_t bits = 0;
+            memcpy(&bits, raw + (size_t)s * 4, sizeof(bits));
+
+            NSNumber *key = [NSNumber numberWithUnsignedLongLong:
+                             v + (uint64_t)s * 4];
+            uint32_t oldBits = [[prev objectForKey:key] unsignedIntValue];
+
+            float oldF = 0.0f;
+            float newF = 0.0f;
+            memcpy(&oldF, &oldBits, sizeof(oldF));
+            memcpy(&newF, &bits, sizeof(newF));
+
+            [self vlogLine:@"census chg V=0x%llx +0x%03x  %.4f -> %.4f",
+                        (unsigned long long)v, (unsigned)s * 4, oldF, newF];
+        }
+    }
+
+    if (!stopped)
+        _actorSlots = next;
+
+    [self logLine:@"census: %d actors / %d changed / %d changed slots / %d stride-0x58 members",
+               scanned, changedActors, changedSlots, runMembers];
+
+    if (stopped)
+        [self logLine:@"scan stopped"];
 }
 
 @end
