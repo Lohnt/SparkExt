@@ -1,5 +1,7 @@
 #import <UIKit/UIKit.h>
 
+#import "DiagViewController.h"
+
 /* Round 29 ESP: one immutable draw snapshot, published with an atomic swap
    when the ESP pipeline completes. The overlay draws only from it. Scan
    activity writes the staging buffer in DiagViewController.h instead, so it
