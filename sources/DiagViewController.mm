@@ -128,6 +128,11 @@ static std::atomic<bool> gStopRequested(false);
    binary. Keeping it as a real object makes the SAME suffix verifiable. */
 __attribute__((used)) static const char kTailSame[] = " SAME";
 
+/* Same problem, same fix: the MAT2 row-3 signatures are short literals and one
+   of them gets folded away when handed straight to a format argument. */
+__attribute__((used)) static const char kRow3Pos[] = "0,0,1,0";
+__attribute__((used)) static const char kRow3Neg[] = "0,0,-1,0";
+
 /* One K_1779 hit plus whether the K_7301 config link happens to hang off it.
    config_link is reported, never used as an acceptance gate. */
 typedef struct {
@@ -2139,7 +2144,7 @@ stopped:
                     fv[i + 4], fv[i + 5], fv[i + 6], fv[i + 7],
                     fv[i + 8], fv[i + 9], fv[i + 10], fv[i + 11],
                     fv[i + 12], fv[i + 13], fv[i + 14], fv[i + 15],
-                    (tag[i] & VIEW_TAG_MAT2_POS) ? "0,0,1,0" : "0,0,-1,0"];
+                    (tag[i] & VIEW_TAG_MAT2_POS) ? kRow3Pos : kRow3Neg];
     }
 
     free(raw);
