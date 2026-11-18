@@ -4104,6 +4104,8 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
        other; ESP falls back to the cached forward when this read fails. */
     float selfF[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     bool haveSelfF = false;
+    bool haveSelfQ = false;
+    float selfQ[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
     if (selfT && mr_read(task, selfT + 0x130, selfF, sizeof(selfF))) {
         float fl = sqrtf(selfF[0] * selfF[0] + selfF[1] * selfF[1] +
@@ -4111,6 +4113,29 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
         if (isfinite(selfF[0]) && isfinite(selfF[1]) && isfinite(selfF[2]) &&
             fl >= ESP_CAM_FWD_MIN && fl <= ESP_CAM_FWD_MAX)
             haveSelfF = true;
+
+        /* Round 40: the 16-byte row after the position is a rotation
+           quaternion, not a direction - its length is 1 either way, so the
+           fourth component decides. Forward = q * (0,0,1). */
+        memcpy(selfQ, selfF, sizeof(selfQ));
+
+        if (haveSelfF && fabsf(selfQ[3]) > 0.05f) {
+            float qf[3];
+
+            if (cam_fwd_from_quat(selfQ, qf)) {
+                selfF[0] = qf[0];
+                selfF[1] = qf[1];
+                selfF[2] = qf[2];
+                selfF[3] = 0.0f;
+                haveSelfQ = true;
+            }
+        }
+    }
+
+    if (haveSelfQ) {
+        [self vlogLine:@"cam: view quat=(%.3f,%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) src=T",
+                    selfQ[0], selfQ[1], selfQ[2], selfQ[3],
+                    selfF[0], selfF[1], selfF[2]];
     }
 
     /* Round 38: the view-state camera is the primary source, but _localV can be
@@ -4152,6 +4177,17 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                 continue;
             if (!isfinite(fl) || fl < ESP_CAM_FWD_MIN || fl > ESP_CAM_FWD_MAX)
                 continue;
+
+            if (fabsf(f[3]) > 0.05f) {
+                float qf[3];
+
+                if (cam_fwd_from_quat(f, qf)) {
+                    f[0] = qf[0];
+                    f[1] = qf[1];
+                    f[2] = qf[2];
+                    f[3] = 0.0f;
+                }
+            }
 
             float score = 0.0f;
             if (_prevSelfValid) {

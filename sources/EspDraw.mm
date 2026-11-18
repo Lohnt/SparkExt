@@ -97,6 +97,43 @@ static bool esp_project_point(const float *p, const float *cam,
     return isfinite(out->x) && isfinite(out->y);
 }
 
+/* Round 40: camera basis for projection. fwd is the camera forward; the screen
+   right axis is horizontal and the screen up axis is fwd x right, so a level
+   camera maps +x to screen right and +y to screen up. Unity's forward x up
+   points screen-LEFT, which was the mirroring bug. */
+static bool esp_camera_basis(const esp_snapshot *s, float *fwd,
+                             float *right, float *upv)
+{
+    fwd[0] = s->camF[0];
+    fwd[1] = s->camF[1];
+    fwd[2] = s->camF[2];
+
+    float fl = sqrtf(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+    if (!(fl > 1e-4f) || !isfinite(fl))
+        return false;
+
+    fwd[0] /= fl;
+    fwd[1] /= fl;
+    fwd[2] /= fl;
+
+    right[0] = fwd[2];
+    right[1] = 0.0f;
+    right[2] = -fwd[0];
+
+    float rl = sqrtf(right[0] * right[0] + right[2] * right[2]);
+    if (!(rl > 1e-4f))
+        return false;   /* camera looking straight up or down: no screen basis */
+
+    right[0] /= rl;
+    right[2] /= rl;
+
+    upv[0] = fwd[1] * right[2] - fwd[2] * right[1];
+    upv[1] = fwd[2] * right[0] - fwd[0] * right[2];
+    upv[2] = fwd[0] * right[1] - fwd[1] * right[0];
+
+    return true;
+}
+
 /* Project every staged root at this screen size. behind counts roots rejected
    by the near-plane test (z_v <= ESP_NEAR_PLANE); skipped counts roots that
    passed it but produced no usable box (crown behind, sub-pixel height). */
@@ -133,27 +170,12 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
     float cy = H * 0.5f;
 
     const float *cam = s->camP;
-    float fwd[3] = { s->camF[0], s->camF[1], s->camF[2] };
-    float fl = sqrtf(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
-    if (!(fl > 1e-4f))
+    float fwd[3];
+    float right[3];
+    float upv[3];
+
+    if (!esp_camera_basis(s, fwd, right, upv))
         return 0;
-    fwd[0] /= fl;
-    fwd[1] /= fl;
-    fwd[2] /= fl;
-
-    /* right = normalize(cross(fwd, (0,1,0))) = normalize(-fwd.z, 0, fwd.x) */
-    float right[3] = { -fwd[2], 0.0f, fwd[0] };
-    float rl = sqrtf(right[0] * right[0] + right[2] * right[2]);
-    if (!(rl > 1e-4f))
-        return 0;   /* camera looking straight up or down: no screen basis */
-
-    right[0] /= rl;
-    right[2] /= rl;
-
-    /* upv = cross(right, fwd) */
-    float upv[3] = { right[1] * fwd[2] - right[2] * fwd[1],
-                     right[2] * fwd[0] - right[0] * fwd[2],
-                     right[0] * fwd[1] - right[1] * fwd[0] };
 
     int n = s->rootN < ESP_MAX_BOXES ? s->rootN : ESP_MAX_BOXES;
 
@@ -522,6 +544,55 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
     [self espFrameSnapshot:s report:NO];
 }
 
+/* Round 40: one-line audit of the first two projections, so a wrong basis,
+   scale or mirror is visible in the log instead of inferred from box pixels. */
+- (void)espLogProjection:(const esp_snapshot *)s size:(CGSize)size
+{
+    if (!s || !s->haveCam || s->rootN <= 0)
+        return;
+
+    float fwd[3], right[3], upv[3];
+    if (!esp_camera_basis(s, fwd, right, upv))
+        return;
+
+    float W = (float)size.width;
+    float H = (float)size.height;
+    if (W < 1.0f || H < 1.0f)
+        return;
+
+    float tanHalf = tanf((float)s->fovDeg * 0.5f * (float)M_PI / 180.0f);
+    if (!(tanHalf > 1e-4f))
+        tanHalf = 1e-4f;
+
+    float sx = (W * 0.5f) / tanHalf;
+    float cx = W * 0.5f;
+    float cy = H * 0.5f;
+
+    int n = s->rootN < 2 ? s->rootN : 2;
+
+    for (int i = 0; i < n; i++) {
+        const float *root = s->roots + (size_t)i * 3;
+
+        float dx = root[0] - s->camP[0];
+        float dy = root[1] - s->camP[1];
+        float dz = root[2] - s->camP[2];
+
+        float zv = dx * fwd[0] + dy * fwd[1] + dz * fwd[2];
+        float xv = dx * right[0] + dy * right[1] + dz * right[2];
+        float yv = dx * upv[0] + dy * upv[1] + dz * upv[2];
+
+        float px = cx + (xv / zv) * sx;
+        float py = cy - (yv / zv) * sx;
+
+        if (s->mirror)
+            px = cx * 2.0f - px;
+
+        [self vlogLine:@"ESP PROJ %d root=(%.2f,%.2f,%.2f) delta=(%.2f,%.2f,%.2f) view=(%.2f,%.2f,%.2f) screen=(%.0f,%.0f) scale=%.1f fov=%d mir=%d",
+                    i, root[0], root[1], root[2], dx, dy, dz,
+                    xv, yv, zv, px, py, sx, s->fovDeg, s->mirror];
+    }
+}
+
 /* Main thread: draw one snapshot and, at completion, report it. The report is
    the user's completion flag, so it is printed even when nothing was drawn. */
 - (void)espFrameSnapshot:(const esp_snapshot *)s report:(BOOL)report
@@ -564,6 +635,9 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
 
     int drawn = esp_build_boxes(s, size, boxes, ESP_MAX_BOXES,
                                 skips, ESP_MAX_BOXES, &behind, &skipped);
+
+    if (report)
+        [self espLogProjection:s size:size];
 
     CGRect rects[ESP_MAX_BOXES];
     float dists[ESP_MAX_BOXES];
