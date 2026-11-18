@@ -22,6 +22,7 @@ typedef struct {
     int fovDeg;                    /* horizontal FOV used for this snapshot */
     int camSrc;                    /* 0 none, 1 fresh forward, 2 cached forward */
     int rootN;                     /* humanoid roots copied from staging */
+    int bindN;                     /* skeletons found but not drawable */
     BOOL haveCam;
     float camP[3];
     float camF[3];
@@ -253,6 +254,7 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
 
     _espMode = YES;
     _espStageN = 0;
+    _espStageBind = 0;
     _espStageHaveCam = NO;
     _espStageCamSrc = 0;
 
@@ -338,6 +340,7 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
                      f:(const float *)camF haveF:(bool)haveCamF
 {
     _espStageN = 0;
+    _espStageBind = 0;
     _espStageHaveCam = NO;
     _espStageCamSrc = 0;
 
@@ -384,6 +387,7 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
     s->camSrc = _espStageCamSrc;
     s->haveCam = _espStageHaveCam ? YES : NO;
     s->rootN = _espStageN;
+    s->bindN = _espStageBind;
 
     if (s->rootN < 0)
         s->rootN = 0;
@@ -423,6 +427,7 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
 
     _espMode = NO;
     _espStageN = 0;
+    _espStageBind = 0;
     _espStageHaveCam = NO;
     _espStageCamSrc = 0;
 
@@ -505,12 +510,15 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
     }
 
     int roots = s ? s->rootN : 0;
+    int bind = s ? s->bindN : 0;
     BOOL haveCam = s ? s->haveCam : NO;
     int fov = s ? s->fovDeg : [self espFovDegrees];
     double age = s ? (CFAbsoluteTimeGetCurrent() - s->stamp) : 0.0;
 
     NSString *status = nil;
-    if (roots <= 0)
+    if (roots <= 0 && bind > 0)
+        status = @"skeletons present, world roots missing";
+    else if (roots <= 0)
         status = @"no skeletons this scan";
     else if (!haveCam)
         status = @"no camera this scan";
@@ -525,11 +533,15 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
     if (!report)
         return;
 
-    if (roots <= 0)
-        [self logLine:@"ESP done: roots=0 (no skeletons / no camera)"];
+    if (roots <= 0 && bind > 0)
+        [self logLine:@"ESP done: roots=0 drawn=%d behind=%d bind=%d fov=%d (skeletons present, world roots missing)",
+                   drawn, behind, bind, fov];
+    else if (roots <= 0)
+        [self logLine:@"ESP done: roots=0 drawn=%d behind=%d bind=%d fov=%d (no skeletons / no camera)",
+                   drawn, behind, bind, fov];
     else
-        [self logLine:@"ESP done: roots=%d drawn=%d behind=%d fov=%d",
-                   roots, drawn, behind, fov];
+        [self logLine:@"ESP done: roots=%d drawn=%d behind=%d bind=%d fov=%d",
+                   roots, drawn, behind, bind, fov];
 
     for (int i = 0; i < drawn; i++) {
         esp_box *b = &boxes[i];

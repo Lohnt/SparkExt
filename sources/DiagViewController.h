@@ -90,6 +90,7 @@ typedef struct {
        cannot blank or corrupt what is on screen. */
     float _espStageRoots[ESP_MAX_BOXES * 3];
     int _espStageN;
+    int _espStageBind;             /* bind-pose skeletons with no world root */
     BOOL _espStageHaveCam;
     int _espStageCamSrc;           /* 0 none, 1 fresh forward, 2 cached forward */
     float _espStageCamP[3];

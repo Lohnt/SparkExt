@@ -98,12 +98,16 @@
 #define PLANET_GHOST_MAX    128
 
 /* --- round 27: HUMANOID arrays and projection-matrix hunt ---------------- */
-#define PLANET_HUMAN_MIN    100      /* slots in a humanoid transform array */
+/* Round 30: practice-mode skeletons are ~69 slots long, so the count floor is
+   60. Qualification is the head height plus the four bone gaps below. */
+#define PLANET_HUMAN_MIN    60      /* slots in a humanoid transform array */
 #define PLANET_HUMAN_MAX    40      /* screen lines */
-#define PLANET_HUMAN_HEADLO 0.80f
-#define PLANET_HUMAN_HEADHI 1.05f
+#define PLANET_HUMAN_HEADLO 0.90f
+#define PLANET_HUMAN_HEADHI 1.00f
 #define PLANET_HUMAN_OWNER  0x100    /* owner header window before base */
 #define PLANET_HUMAN_ROWS   9        /* slot0..slot8 */
+#define PLANET_HUMAN_PRE    0x200    /* companion transform window before base */
+#define PLANET_HUMAN_PRE_STEP 0x10   /* TRS scan granularity in that window */
 #define PLANET_PROJ_SPAN    0x1000
 #define PLANET_PROJ_HALF    0x800
 #define PLANET_PROJ_EACH    20       /* candidates per anchor */
@@ -848,6 +852,86 @@ static bool planet_trs_ok(const uint8_t *p, float *posOut)
     return true;
 }
 
+/* Round 30 humanoid signature. Practice bots ship a 60-70 slot skeleton whose
+   first slots are not at the old slot2 head height, but the chain still walks
+   feet -> head: one of slot0..slot3 sits at y 0.90..1.00 and the four bone gaps
+   below follow within the next eight slots. Returns the head slot index, or -1
+   when the array is not a humanoid. */
+static int human_sig_start(const uint8_t *raw, int rows)
+{
+    static const float kGap[4] = { 0.121f, 0.146f, 0.138f, 0.105f };
+
+    if (!raw || rows < PLANET_HUMAN_ROWS)
+        return -1;
+
+    float y[PLANET_HUMAN_ROWS];
+    for (int k = 0; k < PLANET_HUMAN_ROWS; k++) {
+        float v = 0.0f;
+        memcpy(&v, raw + (size_t)k * 0x30 + 4, sizeof(v));
+        if (!isfinite(v))
+            return -1;
+        y[k] = v;
+    }
+
+    for (int i = 0; i <= 3; i++) {
+        if (y[i] < PLANET_HUMAN_HEADLO || y[i] > PLANET_HUMAN_HEADHI)
+            continue;
+
+        int found = 0;
+        for (int g = 0; g < 4; g++) {
+            bool hit = false;
+            for (int j = i; j + 1 < PLANET_HUMAN_ROWS && j <= i + 6; j++) {
+                float d = y[j + 1] - y[j];
+                if (fabsf(d - kGap[g]) <= 0.01f) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit)
+                break;
+            found++;
+        }
+
+        if (found == 4)
+            return i;
+    }
+
+    return -1;
+}
+
+/* Round 30: a bind-pose skeleton has its slot0 at exactly (0,0,0) and carries no
+   world position. Practice mode keeps the companion world transform in the
+   0x200 bytes before the chain, so look there for a TRS-qualified, in-map slot.
+   The closest one to the chain wins. */
+static bool human_bind_pre(mach_port_t task, uint64_t base, float *out)
+{
+    if (!out || base <= PLANET_HUMAN_PRE)
+        return false;
+
+    uint8_t win[PLANET_HUMAN_PRE];
+    memset(win, 0, sizeof(win));
+
+    uint64_t start = base - PLANET_HUMAN_PRE;
+    size_t got = hunt_read_obj(task, start, win, PLANET_HUMAN_PRE);
+    if (got < 0x30)
+        return false;
+
+    for (int off = (int)(got - 0x30); off >= 0; off -= PLANET_HUMAN_PRE_STEP) {
+        float pos[3];
+        if (!planet_trs_ok(win + off, pos))
+            continue;
+        if (!planet_pos_ok(pos))
+            continue;
+
+        out[0] = pos[0];
+        out[1] = pos[1];
+        out[2] = pos[2];
+        return true;
+    }
+
+    return false;
+}
+
 static int trs_cmp_addr(const void *a, const void *b)
 {
     const trs_slot *x = (const trs_slot *)a;
@@ -1394,6 +1478,7 @@ stopped:
        published draw snapshot is never touched from here. */
     if (_espMode) {
         _espStageN = 0;
+        _espStageBind = 0;
         _espStageHaveCam = NO;
         _espStageCamSrc = 0;
     }
@@ -2728,11 +2813,12 @@ stopped:
 
     /* ---------------- HUMANOID arrays ----------------------------------- */
 
-    /* A live player/bot owns one long transform chain: >= 100 consecutive
-       slots whose root is the feet position and whose third slot (head, at
-       base+0x60) sits 0.80..1.05 above it. */
+    /* A live player/bot owns one transform chain. Round 30: TDM chains are
+       ~141 slots and practice chains ~69, so the floor is 60 and membership is
+       decided by the head height plus the four bone gaps (human_sig_start). */
     NSMutableSet *humanNow = [NSMutableSet set];
     int humanHits = 0;
+    int humanBind = 0;
 
     /* Round 29 ESP: one camera decision per scan, then the roots below. Both go
        into the worker-owned staging buffer; nothing the overlay reads is written
@@ -2747,26 +2833,61 @@ stopped:
             if (arrs[i].count < PLANET_HUMAN_MIN)
                 continue;
 
-            trs_slot *root = &slots[arrs[i].first];
-            trs_slot *head = &slots[arrs[i].first + 2];
+            /* slot0..slot8 as raw TRS rows: pos, quat, scale. The signature
+               decides membership; the bind-pose test decides drawability. */
+            uint8_t trs[PLANET_HUMAN_ROWS * 0x30];
+            memset(trs, 0, sizeof(trs));
+            size_t th = hunt_read_obj(task, arrs[i].base, trs,
+                                      PLANET_HUMAN_ROWS * 0x30);
+            int rows = (int)(th / 0x30);
 
-            if (!isfinite(root->px) || !isfinite(root->py) ||
-                !isfinite(root->pz) || !isfinite(head->py))
+            int sig = human_sig_start(trs, rows);
+            if (sig < 0)
                 continue;
 
-            if (fabsf(root->px) >= 3000.0f || fabsf(root->pz) >= 3000.0f ||
-                fabsf(root->py) >= 50.0f)
+            float rootP[3];
+            float headP[3];
+            memcpy(rootP, trs, sizeof(rootP));
+            memcpy(headP, trs + (size_t)sig * 0x30, sizeof(headP));
+
+            if (!isfinite(rootP[0]) || !isfinite(rootP[1]) ||
+                !isfinite(rootP[2]) || !isfinite(headP[1]))
                 continue;
 
-            if (head->py < PLANET_HUMAN_HEADLO || head->py > PLANET_HUMAN_HEADHI)
-                continue;
+            BOOL bind = (rootP[0] == 0.0f && rootP[1] == 0.0f &&
+                         rootP[2] == 0.0f);
+            BOOL drawable = NO;
+            const char *roottag = "";
+
+            if (bind) {
+                /* Practice-mode bind pose: the chain carries no world position.
+                   Use the companion transform just before the chain if there is
+                   one, otherwise the skeleton is present but undrawable. */
+                float pre[3];
+                if (human_bind_pre(task, arrs[i].base, pre)) {
+                    rootP[0] = pre[0];
+                    rootP[1] = pre[1];
+                    rootP[2] = pre[2];
+                    drawable = YES;
+                    roottag = " root=pre";
+                } else {
+                    humanBind++;
+                    roottag = " root=BIND";
+                }
+            } else if (fabsf(rootP[0]) < 3000.0f &&
+                       fabsf(rootP[2]) < 3000.0f &&
+                       fabsf(rootP[1]) < 50.0f) {
+                drawable = YES;
+            } else {
+                continue;   /* chain root outside the map: not an actor */
+            }
 
             humanHits++;
 
-            if (_espMode && _espStageN < ESP_MAX_BOXES) {
-                _espStageRoots[_espStageN * 3 + 0] = root->px;
-                _espStageRoots[_espStageN * 3 + 1] = root->py;
-                _espStageRoots[_espStageN * 3 + 2] = root->pz;
+            if (drawable && _espMode && _espStageN < ESP_MAX_BOXES) {
+                _espStageRoots[_espStageN * 3 + 0] = rootP[0];
+                _espStageRoots[_espStageN * 3 + 1] = rootP[1];
+                _espStageRoots[_espStageN * 3 + 2] = rootP[2];
                 _espStageN++;
             }
 
@@ -2775,17 +2896,17 @@ stopped:
             [humanNow addObject:bkey];
 
             if (humanHits <= PLANET_HUMAN_MAX) {
-                [self logLine:@"HUMAN base=0x%llx slots=%d root=(%.3f,%.3f,%.3f) head=(%.3f,%.3f,%.3f)%s",
+                [self logLine:@"HUMAN base=0x%llx slots=%d root=(%.3f,%.3f,%.3f) head=(%.3f,%.3f,%.3f)%s%s",
                            (unsigned long long)arrs[i].base, arrs[i].count,
-                           root->px, root->py, root->pz,
-                           head->px, head->py, head->pz,
-                           stable ? " STABLE" : ""];
+                           rootP[0], rootP[1], rootP[2],
+                           headP[0], headP[1], headP[2],
+                           stable ? " STABLE" : "", roottag];
             } else {
-                [self vlogLine:@"HUMAN base=0x%llx slots=%d root=(%.3f,%.3f,%.3f) head=(%.3f,%.3f,%.3f)%s",
+                [self vlogLine:@"HUMAN base=0x%llx slots=%d root=(%.3f,%.3f,%.3f) head=(%.3f,%.3f,%.3f)%s%s",
                             (unsigned long long)arrs[i].base, arrs[i].count,
-                            root->px, root->py, root->pz,
-                            head->px, head->py, head->pz,
-                            stable ? " STABLE" : ""];
+                            rootP[0], rootP[1], rootP[2],
+                            headP[0], headP[1], headP[2],
+                            stable ? " STABLE" : "", roottag];
             }
 
             /* Owner header just before the chain. */
@@ -2800,15 +2921,6 @@ stopped:
                         (unsigned long long)arrs[i].base];
             [self viewDumpRows:hw have:hh label:"HUMAN"];
 
-            /* slot0..slot8 as raw TRS rows: pos, quat, scale. */
-            int nrow = arrs[i].count < PLANET_HUMAN_ROWS
-                       ? arrs[i].count : PLANET_HUMAN_ROWS;
-            uint8_t trs[PLANET_HUMAN_ROWS * 0x30];
-            memset(trs, 0, sizeof(trs));
-            size_t th = hunt_read_obj(task, arrs[i].base, trs,
-                                      (size_t)nrow * 0x30);
-            int rows = (int)(th / 0x30);
-
             for (int k = 0; k < rows; k++) {
                 float v[12];
                 memcpy(v, trs + (size_t)k * 0x30, sizeof(v));
@@ -2821,9 +2933,11 @@ stopped:
         }
     }
 
-    [self vlogLine:@"human: %d arrays (>=%d slots, head y %.2f..%.2f) / %d anchors",
+    _espStageBind = _espMode ? humanBind : 0;
+
+    [self vlogLine:@"human: %d arrays (>=%d slots, head y %.2f..%.2f) bind=%d / %d anchors",
                 humanHits, PLANET_HUMAN_MIN, PLANET_HUMAN_HEADLO,
-                PLANET_HUMAN_HEADHI, (int)anchors.count];
+                PLANET_HUMAN_HEADHI, humanBind, (int)anchors.count];
 
     _humanPrev = humanNow;
 

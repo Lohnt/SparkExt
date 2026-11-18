@@ -61,6 +61,7 @@ static bool diag_sleep_checked(double seconds)
     _espMode = NO;
     _espFovIdx = ESP_FOV_DEFAULT;
     _espStageN = 0;
+    _espStageBind = 0;
     _espStageHaveCam = NO;
     _espStageCamSrc = 0;
     _espStageCamP[0] = _espStageCamP[1] = _espStageCamP[2] = 0.0f;
