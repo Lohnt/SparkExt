@@ -2029,7 +2029,7 @@ static bool esp_project(const float *p, const float *cam, const float *right,
                 if (!esp_project(crown, cam, right, upv, fwd, sx, cx, cy, &top))
                     continue;
 
-                float h = fabsf(top.y - bot.y);
+                float h = (float)fabs(top.y - bot.y);
                 if (h < ESP_MIN_BOX_PX)
                     continue;
 

@@ -1,5 +1,6 @@
 #import "OverlayWindow.h"
 #import "DiagLog.h"
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
