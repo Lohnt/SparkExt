@@ -94,9 +94,17 @@ typedef struct {
     int _espStageN;
     int _espStageBind;             /* bind-pose skeletons with no world root */
     BOOL _espStageHaveCam;
-    int _espStageCamSrc;           /* 0 none, 1 fresh forward, 2 cached forward */
+    int _espStageCamSrc;           /* 0 none, 1 T, 2 cache, 3 main, 4 get_main, 5 fallback */
     float _espStageCamP[3];
     float _espStageCamF[3];
+
+    /* Round 34: metadata handles kept from bootstrap so the Camera::main
+       resolver can run after the heap pass. */
+    uint64_t _ufBase;
+    uint64_t _tidBase;
+    uint64_t _metaBase;
+    uint64_t _nameOff;
+    int _camKind;
 }
 
 @end

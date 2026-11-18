@@ -926,6 +926,179 @@ static bool human_bind_pre(mach_port_t task, uint64_t base, float *out)
     return false;
 }
 
+/* ------------------------------------------------------- round 34 camera */
+
+/* UnityEngine.Camera lookup. Tuple layout inside the class object: position at
+   the slot, unit quaternion 12 or 16 bytes later, uniform scale 16 after that.
+   Both spacings are tried because native Transform packs Vector3f without the
+   16-byte alignment the bone arrays use. */
+static bool cam_trs_probe(const uint8_t *buf, size_t got, float *pos, float *quat)
+{
+    if (!buf || got < 0x40)
+        return false;
+
+    for (size_t b = 0; b + 0x30 <= got; b += 4) {
+        float p[3];
+        memcpy(p, buf + b, sizeof(p));
+        if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2]))
+            continue;
+        if (fabsf(p[0]) < 1.0f || fabsf(p[0]) > 3000.0f)
+            continue;
+        if (fabsf(p[2]) < 1.0f || fabsf(p[2]) > 3000.0f)
+            continue;
+        if (p[1] < -2.0f || p[1] > 50.0f)
+            continue;
+
+        for (int qo = 12; qo <= 16; qo += 4) {
+            size_t qb = b + (size_t)qo;
+            if (qb + 16 + 12 > got)
+                continue;
+
+            float q[4];
+            memcpy(q, buf + qb, sizeof(q));
+            if (!isfinite(q[0]) || !isfinite(q[1]) ||
+                !isfinite(q[2]) || !isfinite(q[3]))
+                continue;
+
+            float ql = sqrtf(q[0] * q[0] + q[1] * q[1] +
+                             q[2] * q[2] + q[3] * q[3]);
+            if (ql < 0.98f || ql > 1.02f)
+                continue;
+
+            float s[3];
+            memcpy(s, buf + qb + 16, sizeof(s));
+            if (!isfinite(s[0]) || !isfinite(s[1]) || !isfinite(s[2]))
+                continue;
+            if (s[0] < 0.2f || s[0] > 5.0f ||
+                s[1] < 0.2f || s[1] > 5.0f ||
+                s[2] < 0.2f || s[2] > 5.0f)
+                continue;
+            if (fabsf(s[0] - s[1]) > 0.01f || fabsf(s[1] - s[2]) > 0.01f ||
+                fabsf(s[0] - s[2]) > 0.01f)
+                continue;
+
+            memcpy(pos, p, sizeof(p));
+            memcpy(quat, q, sizeof(q));
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/* Rotate (0,0,1) by a unit quaternion: Unity's forward axis. */
+static bool cam_fwd_from_quat(const float *q, float *out)
+{
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+
+    out[0] = 2.0f * (x * z + w * y);
+    out[1] = 2.0f * (y * z - w * x);
+    out[2] = 1.0f - 2.0f * (x * x + y * y);
+
+    float len = sqrtf(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+    if (!isfinite(len) || len < 0.9f || len > 1.1f)
+        return false;
+
+    out[0] /= len;
+    out[1] /= len;
+    out[2] /= len;
+    return true;
+}
+
+static uint64_t cam_class_find(mach_port_t task, uint64_t tidBase,
+                               uint64_t meta, uint64_t nameOff)
+{
+    uint64_t fallback = 0;
+
+    for (uint64_t td = 1; td < 65536ULL; td++) {
+        uint64_t cls = rd64(task, tidBase + td * 8);
+        if (!cls)
+            continue;
+
+        char nm[32];
+        if (!class_name_at(task, cls, nameOff, meta, nm, sizeof(nm)))
+            continue;
+        if (!diag_streq(nm, "Camera"))
+            continue;
+
+        /* Prefer UnityEngine.Camera over game classes named Camera. */
+        uint64_t np = rd64(task, cls + nameOff + 8);
+        if (meta_range_ok(np, meta)) {
+            char ns[32];
+            memset(ns, 0, sizeof(ns));
+            if (mr_read_cstring(task, np, ns, sizeof(ns)) &&
+                diag_streq(ns, "UnityEngine"))
+                return cls;
+        }
+
+        if (!fallback)
+            fallback = cls;
+    }
+
+    return fallback;
+}
+
+/* Camera instance -> m_CachedPtr/native Camera -> transform. The transform may
+   also be a managed Transform wrapper, whose own m_CachedPtr is tested. */
+static bool cam_find_transform(mach_port_t task, uint64_t inst, uint64_t tfCls,
+                               float *pos, float *quat, uint64_t *xfOut)
+{
+    static const uint64_t kNativeOff[4] = { 0x10, 0x8, 0x18, 0x20 };
+    uint64_t cand[32];
+    int nc = 0;
+
+    cand[nc++] = inst;
+
+    /* Managed Camera -> m_CachedPtr (0x10) and neighbours. */
+    for (int i = 0; i < 4 && nc < 8; i++) {
+        uint64_t v = rd64(task, inst + kNativeOff[i]);
+        if (v >= HUNT_PTR_MIN)
+            cand[nc++] = v;
+    }
+
+    /* First native object -> children. Native Component keeps the transform
+       pointer among its first fields; transform wrappers are handled below. */
+    for (int i = 1; i < nc && i < 5; i++) {
+        uint8_t blk[0x100];
+        memset(blk, 0, sizeof(blk));
+        size_t got = hunt_read_obj(task, cand[i], blk, sizeof(blk));
+        for (size_t k = 0; k + 8 <= got && nc < 32; k += 8) {
+            uint64_t v = 0;
+            memcpy(&v, blk + k, sizeof(v));
+            if (v >= HUNT_PTR_MIN)
+                cand[nc++] = v;
+        }
+    }
+
+    for (int i = 0; i < nc; i++) {
+        uint64_t c = cand[i];
+
+        uint8_t buf[0x400];
+        memset(buf, 0, sizeof(buf));
+        size_t got = hunt_read_obj(task, c, buf, sizeof(buf));
+        if (got >= 0x40 && cam_trs_probe(buf, got, pos, quat)) {
+            if (xfOut)
+                *xfOut = c;
+            return true;
+        }
+
+        if (tfCls && rd64(task, c) == tfCls) {
+            uint64_t nat = rd64(task, c + 0x10);
+            if (nat >= HUNT_PTR_MIN) {
+                memset(buf, 0, sizeof(buf));
+                got = hunt_read_obj(task, nat, buf, sizeof(buf));
+                if (got >= 0x40 && cam_trs_probe(buf, got, pos, quat)) {
+                    if (xfOut)
+                        *xfOut = nat;
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 static int trs_cmp_addr(const void *a, const void *b)
 {
     const trs_slot *x = (const trs_slot *)a;
@@ -1387,6 +1560,10 @@ stopped:
 }
 
 
+@interface DiagViewController (CameraMain)
+- (BOOL)resolveMainCameraPos:(float *)posOut fwd:(float *)fwdOut kind:(int *)kindOut;
+@end
+
 @implementation DiagViewController (Scan)
 
 - (NSString *)hitLine:(const hunt_hit *)h objs:(const hunt_obj *)objs
@@ -1553,6 +1730,13 @@ stopped:
                                      actorName, sizeof(actorName), &nameOff);
     if (!haveName)
         nameOff = 0x10;   /* Il2CppClass::name */
+
+    /* Round 34: keep the metadata handles for the Camera::main resolver, which
+       runs after the heap pass. */
+    _ufBase = ctx.uf_base;
+    _tidBase = tidBase;
+    _metaBase = meta;
+    _nameOff = nameOff;
 
     [self vlogLine:@"class(1779) = 0x%llx", ctx.k1779];
     for (uint64_t off = 0; off <= NAME_PROBE_END; off += 8) {
@@ -2574,6 +2758,114 @@ stopped:
 
 /* ---------------- TRS transform-chain hunt ------------------------------ */
 
+/* Round 34: UnityEngine.Camera::main. The practice-mode camera is not the
+   config actor's view state, so the instance is resolved through metadata:
+   Camera class -> static-fields block -> instance whose object header is the
+   Camera class -> native object -> TRS slot -> forward from the quaternion.
+   kind: 3 = static main field, 4 = Camera[] element (get_main/allCameras),
+   5 = fallback instance found in the same statics block. */
+- (BOOL)resolveMainCameraPos:(float *)posOut fwd:(float *)fwdOut kind:(int *)kindOut
+{
+    mach_port_t task = _task;
+
+    if (!task || !_tidBase || !_metaBase)
+        return NO;
+
+    uint64_t cls = cam_class_find(task, _tidBase, _metaBase, _nameOff);
+    if (!cls) {
+        [self vlogLine:@"cam: main class not found (tid=0x%llx meta=0x%llx)",
+                    _tidBase, _metaBase];
+        return NO;
+    }
+
+    uint64_t tfCls = tid_class(task, _tidBase, TD_UNITY_TRANSFORM);
+
+    uint64_t direct = 0;      /* static field holding a Camera instance */
+    uint64_t elem = 0;        /* Camera[] element (allCameras) */
+    uint64_t loose[8];
+    int nLoose = 0;
+    uint64_t sfSeen = 0;
+
+    for (uint64_t off = 0x40; off <= 0x140; off += 8) {
+        uint64_t sf = rd64(task, cls + off);
+        if (sf < HUNT_PTR_MIN)
+            continue;
+
+        uint8_t blk[0x400];
+        memset(blk, 0, sizeof(blk));
+        size_t got = hunt_read_obj(task, sf, blk, sizeof(blk));
+        if (got < 8)
+            continue;
+
+        sfSeen = sf;
+
+        for (size_t i = 0; i + 8 <= got; i += 8) {
+            uint64_t v = 0;
+            memcpy(&v, blk + i, sizeof(v));
+            if (v < HUNT_PTR_MIN)
+                continue;
+
+            if (rd64(task, v) == cls) {
+                if (!direct)
+                    direct = v;
+                continue;
+            }
+
+            /* Managed array: klass, monitor, length, bounds, elements[] at
+               0x20 (0x18 on the older layout). Test both element starts. */
+            for (uint64_t eo = 0x18; eo <= 0x20; eo += 8) {
+                uint64_t e0 = rd64(task, v + eo);
+                if (e0 >= HUNT_PTR_MIN && rd64(task, e0) == cls) {
+                    if (!elem)
+                        elem = e0;
+                }
+            }
+
+            if (nLoose < 8)
+                loose[nLoose++] = v;
+        }
+    }
+
+    [self vlogLine:@"cam: class=0x%llx statics=0x%llx direct=0x%llx elem=0x%llx",
+                cls, sfSeen, direct, elem];
+
+    struct { uint64_t inst; int kind; } tries[12];
+    int nt = 0;
+
+    if (direct)
+        tries[nt].inst = direct, tries[nt++].kind = 3;
+    if (elem)
+        tries[nt].inst = elem, tries[nt++].kind = 4;
+    for (int i = 0; i < nLoose && nt < 12; i++)
+        tries[nt].inst = loose[i], tries[nt++].kind = 5;
+
+    for (int i = 0; i < nt; i++) {
+        float p[3], q[4], f[3];
+
+        if (!cam_find_transform(task, tries[i].inst, tfCls, p, q, NULL))
+            continue;
+        if (!cam_fwd_from_quat(q, f))
+            continue;
+        if (p[0] == 0.0f && p[2] == 0.0f)
+            continue;
+
+        memcpy(posOut, p, sizeof(p));
+        memcpy(fwdOut, f, sizeof(f));
+        if (kindOut)
+            *kindOut = tries[i].kind;
+
+        [self vlogLine:@"cam: inst=0x%llx kind=%d P=(%.3f,%.3f,%.3f) Q=(%.3f,%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f)",
+                    tries[i].inst, tries[i].kind,
+                    p[0], p[1], p[2], q[0], q[1], q[2], q[3],
+                    f[0], f[1], f[2]];
+        return YES;
+    }
+
+    [self vlogLine:@"cam: main unresolved (tried=%d direct=0x%llx elem=0x%llx)",
+                nt, direct, elem];
+    return NO;
+}
+
 /* Independent of the changed blocks: walks the same region list PLANETARY A
    built and tests every absolute 0x30-aligned block for a Unity transform -
    position at +0x00, unit quaternion at +0x10, uniform scale triple at +0x20.
@@ -2817,6 +3109,31 @@ stopped:
     /* Round 29 ESP: one camera decision per scan, then the roots below. Both go
        into the worker-owned staging buffer; nothing the overlay reads is written
        here, so scan activity cannot blank the boxes already on screen. */
+    _camKind = haveCamP ? 1 : 0;
+
+    /* Round 34: the view-state camera (T+0x120) is absent in practice mode, so
+       fall back to UnityEngine.Camera::main through the metadata. */
+    float camClassP[3];
+    float camClassF[3];
+
+    if (!haveCamP) {
+        int kind = 0;
+        if ([self resolveMainCameraPos:camClassP fwd:camClassF kind:&kind]) {
+            camP = camClassP;
+            camF = camClassF;
+            haveCamP = true;
+            haveCamF = true;
+            _camKind = kind;
+
+            const char *csrc = kind == 4 ? "get_main" : (kind == 5 ? "fallback" : "main");
+
+            [self vlogLine:@"cam: main src=%s P=(%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f)",
+                        csrc,
+                        camClassP[0], camClassP[1], camClassP[2],
+                        camClassF[0], camClassF[1], camClassF[2]];
+        }
+    }
+
     if (_espMode)
         [self espStageCamera:camP haveP:haveCamP f:camF haveF:haveCamF];
 

@@ -20,7 +20,7 @@
 typedef struct {
     CFAbsoluteTime stamp;          /* completion time, drives the age text */
     int fovDeg;                    /* horizontal FOV used for this snapshot */
-    int camSrc;                    /* 0 none, 1 fresh forward, 2 cached forward */
+    int camSrc;                    /* 0 none, 1 T (view state), 2 cache, 3 main, 4 get_main, 5 fallback */
     int mirror;                    /* 1: projected x mirrored about centre */
     int rootN;                     /* humanoid roots copied from staging */
     int bindN;                     /* skeletons found but not drawable */
@@ -408,7 +408,7 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
             _espStageCamF[1] = camF[1];
             _espStageCamF[2] = camF[2];
             _espStageHaveCam = YES;
-            _espStageCamSrc = 1;
+            _espStageCamSrc = (_camKind > 1) ? _camKind : 1;
         } else if (hadFwd) {
             /* Position refreshed, the previous forward is still the best guess. */
             _espStageCamF[0] = prev->camF[0];
@@ -454,7 +454,18 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
 
     esp_publish(s);
 
-    const char *src = !s->haveCam ? "none" : (s->camSrc == 2 ? "cache" : "T");
+    const char *src = "none";
+
+    if (s->haveCam) {
+        switch (s->camSrc) {
+        case 1: src = "T"; break;
+        case 2: src = "cache"; break;
+        case 3: src = "main"; break;
+        case 4: src = "get_main"; break;
+        case 5: src = "fallback"; break;
+        default: src = "main"; break;
+        }
+    }
 
     [self vlogLine:@"esp: cam=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) src=%s roots=%d",
                 s->camP[0], s->camP[1], s->camP[2],
