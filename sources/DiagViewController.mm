@@ -90,6 +90,20 @@
 #define PLANET_GHOST_HI     0x16c150000ULL
 #define PLANET_GHOST_MAX    128
 
+/* --- round 27: HUMANOID arrays and projection-matrix hunt ---------------- */
+#define PLANET_HUMAN_MIN    100      /* slots in a humanoid transform array */
+#define PLANET_HUMAN_MAX    40      /* screen lines */
+#define PLANET_HUMAN_HEADLO 0.80f
+#define PLANET_HUMAN_HEADHI 1.05f
+#define PLANET_HUMAN_OWNER  0x100    /* owner header window before base */
+#define PLANET_HUMAN_ROWS   9        /* slot0..slot8 */
+#define PLANET_PROJ_SPAN    0x1000
+#define PLANET_PROJ_HALF    0x800
+#define PLANET_PROJ_EACH    20       /* candidates per anchor */
+#define PLANET_PROJ_SCREEN  40
+#define PLANET_ANCHOR_MAX   64
+#define PLANET_ANCHOR_EPS   0.05f
+
 /* --- il2cpp class metadata ---------------------------------------------- */
 #define ACTOR_NAME_EXPECT  "O7D1D7DB39"
 #define TD_UNITY_TRANSFORM 13036ULL
@@ -861,6 +875,35 @@ static int trs_cmp_count(const void *a, const void *b)
     return x->base < y->base ? -1 : (x->base > y->base ? 1 : 0);
 }
 
+/* Unity projection matrix, row-major indices: m33 ~ 0, a -1 handedness term
+   at either m32 (row-major copies, index 14) or m23 (Unity column-major,
+   index 11), and both focal terms sane. */
+static bool planet_proj_ok(const float *m)
+{
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(m[i]))
+            return false;
+    }
+
+    if (fabsf(m[15]) >= 0.02f)
+        return false;
+
+    bool one14 = (m[14] >= 0.7f && m[14] <= 1.3f) ||
+                 (m[14] <= -0.7f && m[14] >= -1.3f);
+    bool one11 = (m[11] >= 0.7f && m[11] <= 1.3f) ||
+                 (m[11] <= -0.7f && m[11] >= -1.3f);
+
+    if (!one14 && !one11)
+        return false;
+
+    if (m[0] < 0.3f || m[0] > 5.0f)
+        return false;
+    if (m[5] < 0.3f || m[5] > 5.0f)
+        return false;
+
+    return true;
+}
+
 /* 16-bit fingerprint of one 0x20 block: XOR-fold its eight u32 words. */
 static uint16_t planet_hash_block(const uint8_t *p)
 {
@@ -1317,6 +1360,9 @@ stopped:
     NSMutableArray *_moverWatch;
     float _prevSelfP[3];
     BOOL _prevSelfValid;
+
+    /* Round 27: humanoid array bases seen in the previous scan (STABLE tag). */
+    NSMutableSet *_humanPrev;
 }
 
 - (void)appendLog:(NSString *)line;
@@ -1365,7 +1411,10 @@ stopped:
 - (void)runPlanetaryTask:(mach_port_t)task;
 - (void)runTrsHuntTask:(mach_port_t)task
                regions:(const planet_region *)regs
-                 count:(int)count;
+                 count:(int)count
+                  camP:(const float *)camP
+              haveCamP:(bool)haveCamP
+          persistAddrs:(NSArray *)persistAddrs;
 
 @end
 
@@ -1393,6 +1442,7 @@ stopped:
     _moverWatch = [NSMutableArray array];
     _prevSelfP[0] = _prevSelfP[1] = _prevSelfP[2] = 0.0f;
     _prevSelfValid = NO;
+    _humanPrev = [NSMutableSet set];
 
     self.view.backgroundColor = [UIColor blackColor];
 
@@ -2789,10 +2839,15 @@ stopped:
    position at +0x00, unit quaternion at +0x10, uniform scale triple at +0x20.
    Slots are grouped into arrays by 0x30-consecutiveness (gap <= 0x1000). The
    summary is on screen; the array list and the position lists go to the file,
-   with the array listing capped at 4000 slots. */
+   with the array listing capped at 4000 slots. Humanoid arrays (a player /
+   bot transform chain) and projection matrices are decoded from the same
+   pass and close the screen after the TRS line. */
 - (void)runTrsHuntTask:(mach_port_t)task
                regions:(const planet_region *)regs
                  count:(int)count
+                  camP:(const float *)camP
+              haveCamP:(bool)haveCamP
+          persistAddrs:(NSArray *)persistAddrs
 {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
 
@@ -2812,6 +2867,20 @@ stopped:
     int readFails = 0;
     bool capped = false;
     bool stopped = false;
+
+    /* PROJ anchors: this scan's PERSIST blocks first, then any 4-float camera
+       world position row found while the TRS pass reads the heap. */
+    NSMutableArray *anchors = [NSMutableArray arrayWithCapacity:PLANET_ANCHOR_MAX];
+    NSMutableSet *anchorSeen = [NSMutableSet setWithCapacity:PLANET_ANCHOR_MAX];
+
+    for (NSNumber *n in persistAddrs) {
+        if (anchors.count >= PLANET_ANCHOR_MAX)
+            break;
+        if ([anchorSeen containsObject:n])
+            continue;
+        [anchorSeen addObject:n];
+        [anchors addObject:n];
+    }
 
     for (int r = 0; r < count && !capped; r++) {
         if (gStopRequested.load()) {
@@ -2874,6 +2943,41 @@ stopped:
                 slots[nslots].py = pos[1];
                 slots[nslots].pz = pos[2];
                 nslots++;
+            }
+
+            /* Any (P.x, P.y, P.z, 1) row in this chunk is a camera anchor: the
+               projection matrix that goes with it lives within 0x800. */
+            if (haveCamP && anchors.count < PLANET_ANCHOR_MAX) {
+                for (size_t off = 0; off + 16 <= want; off += 4) {
+                    float w4 = 0.0f;
+                    float c0 = 0.0f;
+                    float c1 = 0.0f;
+                    float c2 = 0.0f;
+
+                    memcpy(&w4, chunk + off + 12, sizeof(w4));
+                    if (fabsf(w4 - 1.0f) > PLANET_ANCHOR_EPS)
+                        continue;
+
+                    memcpy(&c0, chunk + off, sizeof(c0));
+                    memcpy(&c1, chunk + off + 4, sizeof(c1));
+                    memcpy(&c2, chunk + off + 8, sizeof(c2));
+
+                    if (fabsf(c0 - camP[0]) > PLANET_ANCHOR_EPS ||
+                        fabsf(c1 - camP[1]) > PLANET_ANCHOR_EPS ||
+                        fabsf(c2 - camP[2]) > PLANET_ANCHOR_EPS)
+                        continue;
+
+                    NSNumber *ak = [NSNumber numberWithUnsignedLongLong:
+                                    p + (uint64_t)off];
+                    if ([anchorSeen containsObject:ak])
+                        continue;
+
+                    [anchorSeen addObject:ak];
+                    [anchors addObject:ak];
+
+                    if (anchors.count >= PLANET_ANCHOR_MAX)
+                        break;
+                }
             }
 
             scanned += want;
@@ -2958,6 +3062,165 @@ stopped:
             free(big);
         }
     }
+
+    /* ---------------- HUMANOID arrays ----------------------------------- */
+
+    /* A live player/bot owns one long transform chain: >= 100 consecutive
+       slots whose root is the feet position and whose third slot (head, at
+       base+0x60) sits 0.80..1.05 above it. */
+    NSMutableSet *humanNow = [NSMutableSet set];
+    int humanHits = 0;
+
+    if (arrs) {
+        for (int i = 0; i < narr; i++) {
+            if (gStopRequested.load())
+                break;
+            if (arrs[i].count < PLANET_HUMAN_MIN)
+                continue;
+
+            trs_slot *root = &slots[arrs[i].first];
+            trs_slot *head = &slots[arrs[i].first + 2];
+
+            if (!isfinite(root->px) || !isfinite(root->py) ||
+                !isfinite(root->pz) || !isfinite(head->py))
+                continue;
+
+            if (fabsf(root->px) >= 3000.0f || fabsf(root->pz) >= 3000.0f ||
+                fabsf(root->py) >= 50.0f)
+                continue;
+
+            if (head->py < PLANET_HUMAN_HEADLO || head->py > PLANET_HUMAN_HEADHI)
+                continue;
+
+            humanHits++;
+
+            NSNumber *bkey = [NSNumber numberWithUnsignedLongLong:arrs[i].base];
+            BOOL stable = [_humanPrev containsObject:bkey];
+            [humanNow addObject:bkey];
+
+            if (humanHits <= PLANET_HUMAN_MAX) {
+                [self logLine:@"HUMAN base=0x%llx slots=%d root=(%.3f,%.3f,%.3f) head=(%.3f,%.3f,%.3f)%s",
+                           (unsigned long long)arrs[i].base, arrs[i].count,
+                           root->px, root->py, root->pz,
+                           head->px, head->py, head->pz,
+                           stable ? " STABLE" : ""];
+            } else {
+                [self vlogLine:@"HUMAN base=0x%llx slots=%d root=(%.3f,%.3f,%.3f) head=(%.3f,%.3f,%.3f)%s",
+                            (unsigned long long)arrs[i].base, arrs[i].count,
+                            root->px, root->py, root->pz,
+                            head->px, head->py, head->pz,
+                            stable ? " STABLE" : ""];
+            }
+
+            /* Owner header just before the chain. */
+            uint64_t hb = (arrs[i].base > PLANET_HUMAN_OWNER)
+                          ? arrs[i].base - PLANET_HUMAN_OWNER : arrs[i].base;
+            uint8_t hw[PLANET_HUMAN_OWNER];
+            memset(hw, 0, sizeof(hw));
+            size_t hh = hunt_read_obj(task, hb, hw, PLANET_HUMAN_OWNER);
+
+            [self vlogLine:@"HUMAN OWNER 0x%llx readable=0x%zx (for 0x%llx)",
+                        (unsigned long long)hb, hh,
+                        (unsigned long long)arrs[i].base];
+            [self viewDumpRows:hw have:hh label:"HUMAN"];
+
+            /* slot0..slot8 as raw TRS rows: pos, quat, scale. */
+            int nrow = arrs[i].count < PLANET_HUMAN_ROWS
+                       ? arrs[i].count : PLANET_HUMAN_ROWS;
+            uint8_t trs[PLANET_HUMAN_ROWS * 0x30];
+            memset(trs, 0, sizeof(trs));
+            size_t th = hunt_read_obj(task, arrs[i].base, trs,
+                                      (size_t)nrow * 0x30);
+            int rows = (int)(th / 0x30);
+
+            for (int k = 0; k < rows; k++) {
+                float v[12];
+                memcpy(v, trs + (size_t)k * 0x30, sizeof(v));
+                [self vlogLine:@"HUMAN SLOT 0x%llx pos=(%.4f,%.4f,%.4f) q=(%.4f,%.4f,%.4f,%.4f) s=(%.4f,%.4f,%.4f)",
+                            (unsigned long long)(arrs[i].base + (uint64_t)k * 0x30),
+                            v[0], v[1], v[2],
+                            v[4], v[5], v[6], v[7],
+                            v[8], v[9], v[10]];
+            }
+        }
+    }
+
+    [self vlogLine:@"human: %d arrays (>=%d slots, head y %.2f..%.2f) / %d anchors",
+                humanHits, PLANET_HUMAN_MIN, PLANET_HUMAN_HEADLO,
+                PLANET_HUMAN_HEADHI, (int)anchors.count];
+
+    _humanPrev = humanNow;
+
+    /* ---------------- PROJ hunt ----------------------------------------- */
+
+    int projTotal = 0;
+    int projScreen = 0;
+    NSMutableSet *projSeen = [NSMutableSet set];
+
+    for (NSNumber *an in anchors) {
+        if (gStopRequested.load())
+            break;
+
+        uint64_t a = [an unsignedLongLongValue];
+        uint64_t sb = (a > PLANET_PROJ_HALF) ? a - PLANET_PROJ_HALF : a;
+        uint8_t *pb = (uint8_t *)malloc(PLANET_PROJ_SPAN);
+
+        if (!pb)
+            break;
+
+        memset(pb, 0, PLANET_PROJ_SPAN);
+        size_t ph = hunt_read_obj(task, sb, pb, PLANET_PROJ_SPAN);
+
+        float pf[PLANET_PROJ_SPAN / 4];
+        int pn = (int)((ph & ~(size_t)3) / 4);
+        memcpy(pf, pb, (size_t)pn * sizeof(float));
+        free(pb);
+
+        int found = 0;
+
+        for (int o = 0; o + 16 <= pn && found < PLANET_PROJ_EACH; o++) {
+            if (!planet_proj_ok(pf + o))
+                continue;
+
+            uint64_t addr = sb + (uint64_t)o * 4;
+            NSNumber *pk = [NSNumber numberWithUnsignedLongLong:addr];
+
+            if ([projSeen containsObject:pk])
+                continue;
+
+            [projSeen addObject:pk];
+            found++;
+            projTotal++;
+
+            float m00 = pf[o];
+            float m11 = pf[o + 5];
+            float m22 = pf[o + 10];
+            float m23 = pf[o + 11];
+            float m32 = pf[o + 14];
+            float fov = 2.0f * atanf(1.0f / fabsf(m11)) * 180.0f / (float)M_PI;
+            const char *layout = (fabsf(m32) >= 0.7f && fabsf(m32) <= 1.3f)
+                                 ? "row" : "col";
+
+            NSString *line = [NSString stringWithFormat:
+                @"PROJ cand 0x%llx: m00=%.4f m11=%.4f m22=%.4f m23=%.4f m32=%.4f fovY=%.2f deg",
+                (unsigned long long)addr, m00, m11, m22, m23, m32, fov];
+
+            if (projScreen < PLANET_PROJ_SCREEN) {
+                [self logLine:@"%@", line];
+                projScreen++;
+            } else {
+                [self vlogLine:@"%@", line];
+            }
+
+            [self vlogLine:@"PROJ ANCHOR 0x%llx base=0x%llx rel=+0x%03x layout=%s",
+                        (unsigned long long)a, (unsigned long long)sb,
+                        (unsigned)(o * 4), layout];
+            [self viewDumpRows:(const uint8_t *)(pf + o) have:0x40 label:"PROJ"];
+        }
+    }
+
+    [self vlogLine:@"proj: %d anchors / %d candidates (%d per anchor cap)",
+                (int)anchors.count, projTotal, PLANET_PROJ_EACH];
 
     free(arrs);
     free(slots);
@@ -3228,6 +3491,9 @@ stopped:
     /* PERSIST: per-position-address SELF distance, rebuilt each scan. */
     NSMutableDictionary *selfPrevNext = [NSMutableDictionary dictionary];
 
+    /* PERSIST addresses double as PROJ anchors for this scan. */
+    NSMutableArray *persistAddrs = [NSMutableArray array];
+
     /* GHOST: at most PLANET_GHOST_MAX 0x200 windows, one per address. */
     NSMutableSet *ghostSeen = [NSMutableSet set];
     __block int ghostCount = 0;
@@ -3401,6 +3667,8 @@ stopped:
                                    (unsigned long long)blockAddr,
                                    [prevD floatValue], sd];
                         dumpWin(blockAddr, "PERSIST", NULL);
+                        [persistAddrs addObject:
+                         [NSNumber numberWithUnsignedLongLong:blockAddr]];
                     }
 
                     if (sd <= 0.5f)
@@ -3580,7 +3848,8 @@ stopped:
     /* TRS runs over the same region list A built, and its summary closes the
        screen for this scan. */
     if (!gStopRequested.load())
-        [self runTrsHuntTask:task regions:sel count:nsel];
+        [self runTrsHuntTask:task regions:sel count:nsel camP:selfP
+                     haveCamP:haveSelfP persistAddrs:persistAddrs];
 
     /* This scan's camera P becomes the GHOST reference for the next one. */
     if (haveSelfP) {
