@@ -1044,7 +1044,7 @@ static bool cam_find_transform(mach_port_t task, uint64_t inst, uint64_t tfCls,
                                float *pos, float *quat, uint64_t *xfOut)
 {
     static const uint64_t kNativeOff[4] = { 0x10, 0x8, 0x18, 0x20 };
-    uint64_t cand[32];
+    uint64_t cand[48];
     int nc = 0;
 
     cand[nc++] = inst;
@@ -1056,13 +1056,16 @@ static bool cam_find_transform(mach_port_t task, uint64_t inst, uint64_t tfCls,
             cand[nc++] = v;
     }
 
-    /* First native object -> children. Native Component keeps the transform
-       pointer among its first fields; transform wrappers are handled below. */
-    for (int i = 1; i < nc && i < 5; i++) {
+    /* Round 36: expand every level-1 pointer's children, not just the first
+       four fields, so a native Camera -> GameObject -> Transform chain is
+       reachable. Transform wrappers are still tested below. */
+    int lvl1 = nc;
+
+    for (int i = 1; i < lvl1 && nc < 48; i++) {
         uint8_t blk[0x100];
         memset(blk, 0, sizeof(blk));
         size_t got = hunt_read_obj(task, cand[i], blk, sizeof(blk));
-        for (size_t k = 0; k + 8 <= got && nc < 32; k += 8) {
+        for (size_t k = 0; k + 8 <= got && nc < 48; k += 8) {
             uint64_t v = 0;
             memcpy(&v, blk + k, sizeof(v));
             if (v >= HUNT_PTR_MIN)
@@ -2764,18 +2767,26 @@ stopped:
    the camera is met. Budget caps the extra reads at 160 MB. */
 static bool cam_heap_scan(mach_port_t task, const planet_region *regs, int count,
                           uint64_t cls, uint64_t tfCls, float *pos, float *quat,
-                          uint64_t *objOut)
+                          uint64_t *firstObj, uint64_t *validObj,
+                          uint64_t *hitsOut, uint64_t *bytesOut)
 {
+    if (hitsOut)
+        *hitsOut = 0;
+    if (bytesOut)
+        *bytesOut = 0;
     if (!regs || count <= 0 || !cls)
         return false;
 
-    size_t budget = 160u * 1024u * 1024u;
-    uint8_t *buf = (uint8_t *)malloc(1u << 20);
+    size_t budget = 384u * 1024u * 1024u;   /* above PLANET_CAP_BYTES: full coverage */
+    const size_t chunkCap = 1u << 18;
+    uint8_t *buf = (uint8_t *)malloc(chunkCap);
 
     if (!buf)
         return false;
 
     bool found = false;
+    uint64_t hits = 0;
+    uint64_t bytes = 0;
 
     for (int r = 0; r < count && budget && !found; r++) {
         uint64_t base = regs[r].base;
@@ -2787,13 +2798,16 @@ static bool cam_heap_scan(mach_port_t task, const planet_region *regs, int count
         uint64_t off = 0;
 
         while (off + 8 <= size && budget && !found) {
-            size_t want = (size_t)((size - off > (1u << 20)) ? (1u << 20)
-                                                            : (size - off));
+            size_t want = (size_t)((size - off > chunkCap) ? chunkCap
+                                                           : (size - off));
             want &= ~(size_t)7;
 
             if (!want)
                 break;
 
+            /* hunt_read_obj halves on failure, so advance by what was actually
+               read. The old code always advanced by the full chunk, which
+               skipped almost all of a region whose read shrank. */
             size_t got = hunt_read_obj(task, base + off, buf, want);
             size_t step = got & ~(size_t)7;
 
@@ -2803,21 +2817,38 @@ static bool cam_heap_scan(mach_port_t task, const planet_region *regs, int count
                 if (v != cls)
                     continue;
 
+                hits++;
                 uint64_t obj = base + off + i;
+
+                if (firstObj && !*firstObj)
+                    *firstObj = obj;
+
                 if (cam_find_transform(task, obj, tfCls, pos, quat, NULL)) {
-                    if (objOut)
-                        *objOut = obj;
+                    if (validObj)
+                        *validObj = obj;
                     found = true;
                     break;
                 }
             }
 
-            off += want;
-            budget = (budget > want) ? budget - want : 0;
+            size_t adv = (got < want) ? step : want;
+
+            if (!adv)
+                adv = 8;
+
+            off += adv;
+            bytes += adv;
+            budget = (budget > adv) ? budget - adv : 0;
         }
     }
 
     free(buf);
+
+    if (hitsOut)
+        *hitsOut = hits;
+    if (bytesOut)
+        *bytesOut = bytes;
+
     return found;
 }
 
@@ -2875,12 +2906,16 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
     int nLoose = 0;
     uint64_t sfSeen = 0;
 
-    /* Round 35: the static-fields pointer is not where the old window looked.
-       Scan the whole Il2CppClass object instead of 0x40..0x140, and treat any
-       readable block with a Camera object inside it as a statics candidate. */
+    /* Round 36: statics must be a real static-fields block, not the class object
+       itself. The old probe accepted the class address (statics == class) and
+       then read the class header/vtable as fields, so every candidate was junk.
+       A block only counts when it actually contains a Camera instance or a
+       Camera[] element; the class object and its own interior are skipped. */
     for (uint64_t off = 0x00; off <= 0x400; off += 8) {
         uint64_t sf = rd64(task, cls + off);
         if (sf < HUNT_PTR_MIN || sf > 0x0000ffffffffffffULL)
+            continue;
+        if (sf == cls || (sf >= cls && sf < cls + 0x1000))
             continue;
 
         uint8_t blk[0x800];
@@ -2889,7 +2924,7 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
         if (got < 8)
             continue;
 
-        bool used = false;
+        bool hit = false;
 
         for (size_t i = 0; i + 8 <= got; i += 8) {
             uint64_t v = 0;
@@ -2900,7 +2935,7 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
             if (cam_obj_kind(task, v, cls, _metaBase, _nameOff)) {
                 if (!direct)
                     direct = v;
-                used = true;
+                hit = true;
                 continue;
             }
 
@@ -2911,20 +2946,17 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                 if (cam_obj_kind(task, e0, cls, _metaBase, _nameOff)) {
                     if (!elem)
                         elem = e0;
-                    used = true;
+                    hit = true;
                 }
             }
 
-            if (nLoose < 8)
+            if (nLoose < 8 && !hit)
                 loose[nLoose++] = v;
         }
 
-        if (used && !sfSeen)
+        if (hit && !sfSeen)
             sfSeen = sf;
     }
-
-    [self vlogLine:@"cam: class=0x%llx statics=0x%llx direct=0x%llx elem=0x%llx",
-                cls, sfSeen, direct, elem];
 
     struct { uint64_t inst; int kind; } tries[12];
     int nt = 0;
@@ -2935,6 +2967,9 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
         tries[nt].inst = elem, tries[nt++].kind = 4;
     for (int i = 0; i < nLoose && nt < 12; i++)
         tries[nt].inst = loose[i], tries[nt++].kind = 5;
+
+    [self vlogLine:@"cam: class=0x%llx statics=0x%llx direct=0x%llx elem=0x%llx tried=%d",
+                cls, sfSeen, direct, elem, nt];
 
     for (int i = 0; i < nt; i++) {
         float p[3], q[4], f[3];
@@ -2958,25 +2993,45 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
         return YES;
     }
 
-    /* Round 35: last resort - walk the same heap regions the TRS pass reads and
-       accept the first object whose header is the Camera class and whose native
-       side yields a real TRS. One match is enough, so the scan stops early. */
-    if (regs && count > 0) {
+    /* Round 36: heap fallback ALWAYS runs after the statics attempts and always
+       reports what it did. Camera components live on the managed heap, so a
+       klass-pointer match plus the native TRS probe is the robust path. */
+    {
         float p[3], q[4], f[3];
-        uint64_t obj = 0;
+        uint64_t first = 0, valid = 0, hits = 0, bytes = 0;
+        bool ok = false;
 
-        if (cam_heap_scan(task, regs, count, cls, tfCls, p, q, &obj)) {
-            if (cam_fwd_from_quat(q, f) && !(p[0] == 0.0f && p[2] == 0.0f)) {
-                memcpy(posOut, p, sizeof(p));
-                memcpy(fwdOut, f, sizeof(f));
-                if (kindOut)
-                    *kindOut = 5;
+        memset(p, 0, sizeof(p));
+        memset(q, 0, sizeof(q));
 
-                [self vlogLine:@"cam: inst=0x%llx kind=5 P=(%.3f,%.3f,%.3f) Q=(%.3f,%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f)",
-                            obj, p[0], p[1], p[2], q[0], q[1], q[2], q[3],
-                            f[0], f[1], f[2]];
-                return YES;
+        ok = cam_heap_scan(task, regs, count, cls, tfCls, p, q,
+                           &first, &valid, &hits, &bytes);
+
+        [self vlogLine:@"cam: heap scan regions=%d hits=%llu bytes=%llu MB first=0x%llx valid=0x%llx ok=%d",
+                    count, (unsigned long long)hits,
+                    (unsigned long long)(bytes / (1024ULL * 1024ULL)),
+                    first, valid, ok ? 1 : 0];
+
+        if (!ok && first) {
+            uint32_t raw[8];
+            memset(raw, 0, sizeof(raw));
+            if (mr_read(task, first, raw, sizeof(raw))) {
+                [self vlogLine:@"cam: heap cand 0x%llx raw=%08x %08x %08x %08x %08x %08x %08x %08x",
+                            first, raw[0], raw[1], raw[2], raw[3],
+                            raw[4], raw[5], raw[6], raw[7]];
             }
+        }
+
+        if (ok && cam_fwd_from_quat(q, f) && !(p[0] == 0.0f && p[2] == 0.0f)) {
+            memcpy(posOut, p, sizeof(p));
+            memcpy(fwdOut, f, sizeof(f));
+            if (kindOut)
+                *kindOut = 5;
+
+            [self vlogLine:@"cam: inst=0x%llx kind=5 P=(%.3f,%.3f,%.3f) Q=(%.3f,%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f)",
+                        valid, p[0], p[1], p[2], q[0], q[1], q[2], q[3],
+                        f[0], f[1], f[2]];
+            return YES;
         }
     }
 
