@@ -986,6 +986,140 @@ static bool cam_trs_probe(const uint8_t *buf, size_t got, float *pos, float *qua
     return false;
 }
 
+/* Round 37: world root for a bind-pose skeleton. The chain rows are model
+   space, so the owning object is probed instead: a pointer target is read and
+   tested for a TRS row with an in-map position, both directly and through its
+   managed m_CachedPtr (0x10). */
+static bool human_world_pos_ok(const float *p)
+{
+    if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2]))
+        return false;
+    if (fabsf(p[0]) > 3000.0f || fabsf(p[2]) > 3000.0f)
+        return false;
+    if (fabsf(p[1]) > 500.0f)
+        return false;
+    if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f)
+        return false;
+    return true;
+}
+
+static bool human_probe_ptr(mach_port_t task, uint64_t c, float *out,
+                            uint64_t *srcOut)
+{
+    uint8_t buf[0x400];
+    float p[3], q[4];
+
+    if (!out || c < HUNT_PTR_MIN)
+        return false;
+
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t addr = c;
+
+        if (pass == 1) {
+            addr = rd64(task, c + 0x10);
+            if (addr < HUNT_PTR_MIN)
+                break;
+        }
+
+        memset(buf, 0, sizeof(buf));
+        size_t got = hunt_read_obj(task, addr, buf, sizeof(buf));
+        if (got < 0x30)
+            continue;
+        if (!cam_trs_probe(buf, got, p, q))
+            continue;
+        if (!human_world_pos_ok(p))
+            continue;
+
+        memcpy(out, p, sizeof(p));
+        if (srcOut)
+            *srcOut = addr;
+        return true;
+    }
+
+    return false;
+}
+
+/* Pointers in the 0x100-byte owner header before the chain, plus one level of
+   their children: the actor root Transform is normally the first component. */
+static bool human_owner_root(mach_port_t task, uint64_t base, float *out,
+                             uint64_t *srcOut)
+{
+    if (!out || base <= PLANET_HUMAN_OWNER)
+        return false;
+
+    uint64_t hb = base - PLANET_HUMAN_OWNER;
+    uint8_t hw[PLANET_HUMAN_OWNER];
+    memset(hw, 0, sizeof(hw));
+    size_t hh = hunt_read_obj(task, hb, hw, sizeof(hw));
+    if (hh < 8)
+        return false;
+
+    uint64_t cand[40];
+    int nc = 0;
+
+    for (size_t i = 0; i + 8 <= hh && nc < 12; i += 8) {
+        uint64_t v = 0;
+        memcpy(&v, hw + i, sizeof(v));
+        if (v >= HUNT_PTR_MIN && v <= 0x0000ffffffffffffULL)
+            cand[nc++] = v;
+    }
+
+    int lvl1 = nc;
+
+    for (int i = 0; i < lvl1 && nc < 40; i++) {
+        uint8_t blk[0x100];
+        memset(blk, 0, sizeof(blk));
+        size_t got = hunt_read_obj(task, cand[i], blk, sizeof(blk));
+        for (size_t k = 0; k + 8 <= got && nc < 40; k += 8) {
+            uint64_t v = 0;
+            memcpy(&v, blk + k, sizeof(v));
+            if (v >= HUNT_PTR_MIN && v <= 0x0000ffffffffffffULL)
+                cand[nc++] = v;
+        }
+    }
+
+    for (int i = 0; i < nc; i++) {
+        if (human_probe_ptr(task, cand[i], out, srcOut))
+            return true;
+    }
+
+    return false;
+}
+
+/* Wider companion scan: a TRS-qualified, in-map, non-zero row in the 0x1000
+   bytes before the chain. Covers actors whose root transform sits further back
+   than the 0x200 window used since round 30. */
+static bool human_wide_pre(mach_port_t task, uint64_t base, float *out,
+                           uint64_t *srcOut)
+{
+    const uint64_t win = 0x1000;
+
+    if (!out || base <= win)
+        return false;
+
+    uint8_t buf[0x1000];
+    memset(buf, 0, sizeof(buf));
+    size_t got = hunt_read_obj(task, base - win, buf, sizeof(buf));
+    if (got < 0x30)
+        return false;
+
+    for (int off = (int)(got - 0x30); off >= 0; off -= PLANET_HUMAN_PRE_STEP) {
+        float pos[3];
+
+        if (!planet_trs_ok(buf + off, pos))
+            continue;
+        if (!human_world_pos_ok(pos))
+            continue;
+
+        memcpy(out, pos, sizeof(pos));
+        if (srcOut)
+            *srcOut = base - win + (uint64_t)off;
+        return true;
+    }
+
+    return false;
+}
+
 /* Rotate (0,0,1) by a unit quaternion: Unity's forward axis. */
 static bool cam_fwd_from_quat(const float *q, float *out)
 {
@@ -3344,21 +3478,39 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                          rootP[2] == 0.0f);
             BOOL drawable = NO;
             const char *roottag = "";
+            const char *rootsrc = bind ? "none" : "chain";
+            uint64_t rootAddr = bind ? 0 : arrs[i].base;
 
             if (bind) {
-                /* Practice-mode bind pose: the chain carries no world position.
-                   Use the companion transform just before the chain if there is
-                   one, otherwise the skeleton is present but undrawable. */
+                /* Practice-mode bind pose: the chain rows are model space.
+                   Companion row first, then the owning object probed from the
+                   owner header, then the wider 0x1000 window. */
                 float pre[3];
+                uint64_t src = 0;
+
                 if (human_bind_pre(task, arrs[i].base, pre)) {
-                    rootP[0] = pre[0];
-                    rootP[1] = pre[1];
-                    rootP[2] = pre[2];
                     drawable = YES;
                     roottag = " root=pre";
+                    rootsrc = "pre";
+                } else if (human_owner_root(task, arrs[i].base, pre, &src)) {
+                    drawable = YES;
+                    roottag = " root=owner";
+                    rootsrc = "owner";
+                    rootAddr = src;
+                } else if (human_wide_pre(task, arrs[i].base, pre, &src)) {
+                    drawable = YES;
+                    roottag = " root=wide";
+                    rootsrc = "wide";
+                    rootAddr = src;
                 } else {
                     humanBind++;
                     roottag = " root=BIND";
+                }
+
+                if (drawable) {
+                    rootP[0] = pre[0];
+                    rootP[1] = pre[1];
+                    rootP[2] = pre[2];
                 }
             } else if (fabsf(rootP[0]) < 3000.0f &&
                        fabsf(rootP[2]) < 3000.0f &&
@@ -3369,6 +3521,10 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
             }
 
             humanHits++;
+
+            [self vlogLine:@"human: root=0x%llx bind=%d src=%s slots=%d P=(%.3f,%.3f,%.3f)",
+                        rootAddr, bind ? 1 : 0, rootsrc, arrs[i].count,
+                        rootP[0], rootP[1], rootP[2]];
 
             if (drawable && _espMode && _espStageN < ESP_MAX_BOXES) {
                 _espStageRoots[_espStageN * 3 + 0] = rootP[0];
