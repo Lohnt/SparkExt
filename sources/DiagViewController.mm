@@ -2,6 +2,7 @@
 #import "MemRead.h"
 #import "Il2Cpp.h"
 #import "DiagLog.h"
+#import "OverlayWindow.h"
 
 #import <UIKit/UIKit.h>
 #include <atomic>
@@ -103,6 +104,17 @@
 #define PLANET_PROJ_SCREEN  40
 #define PLANET_ANCHOR_MAX   64
 #define PLANET_ANCHOR_EPS   0.05f
+
+/* Round 28: ESP v1. Humanoid root heights and FOV calibration. */
+#define ESP_MAX_BOXES       128
+#define ESP_FOV_COUNT       8
+#define ESP_FOV_DEFAULT     4        /* index of 100 degrees */
+#define ESP_BODY_HEIGHT     1.8f     /* feet -> crown, metres */
+#define ESP_BOX_WIDTH_RATIO 0.25f    /* box width = height / 4 */
+#define ESP_MIN_BOX_PX      2.0f
+#define ESP_NEAR_PLANE      0.1f
+#define ESP_CAM_FWD_MIN     0.5f
+#define ESP_CAM_FWD_MAX     1.5f
 
 /* --- il2cpp class metadata ---------------------------------------------- */
 #define ACTOR_NAME_EXPECT  "O7D1D7DB39"
@@ -1318,6 +1330,31 @@ stopped:
     return -1;
 }
 
+/* ---------------- ESP projection ---------------------------------------- */
+
+/* World -> overlay point. right/upv/fwd are the camera basis built in
+   esp_redraw; sx = (W/2)/tan(fovX/2), so a point on the optical axis lands in
+   the middle of the screen with square pixels. */
+static bool esp_project(const float *p, const float *cam, const float *right,
+                        const float *upv, const float *fwd, float sx,
+                        float cx, float cy, CGPoint *out)
+{
+    float vx = p[0] - cam[0];
+    float vy = p[1] - cam[1];
+    float vz = p[2] - cam[2];
+
+    float zv = vx * fwd[0] + vy * fwd[1] + vz * fwd[2];
+    if (!isfinite(zv) || zv <= ESP_NEAR_PLANE)
+        return false;
+
+    float xv = vx * right[0] + vy * right[1] + vz * right[2];
+    float yv = vx * upv[0] + vy * upv[1] + vz * upv[2];
+
+    out->x = cx + (xv / zv) * sx;
+    out->y = cy - (yv / zv) * sx;
+    return isfinite(out->x) && isfinite(out->y);
+}
+
 @interface DiagViewController () {
     UITextView *_textView;
     UIButton *_rerunButton;
@@ -1363,6 +1400,23 @@ stopped:
 
     /* Round 27: humanoid array bases seen in the previous scan (STABLE tag). */
     NSMutableSet *_humanPrev;
+
+    /* Round 28 ESP v1: the overlay toggle, the FOV calibration control, and
+       the last scan's camera + humanoid roots, kept so a FOV change redraws
+       instantly without touching the game again. */
+    UIButton *_espButton;
+    UISegmentedControl *_fovControl;
+    BOOL _espMode;
+    BOOL _espEverScanned;
+    int _espFovIdx;
+    CFAbsoluteTime _espStamp;
+    float *_espRoots;
+    int _espRootN;
+    int _espRootCap;
+    BOOL _espHaveCam;
+    float _espCamP[3];
+    float _espCamF[3];
+    NSTimer *_espTimer;
 }
 
 - (void)appendLog:(NSString *)line;
@@ -1414,7 +1468,20 @@ stopped:
                  count:(int)count
                   camP:(const float *)camP
               haveCamP:(bool)haveCamP
+                  camF:(const float *)camF
+              haveCamF:(bool)haveCamF
           persistAddrs:(NSArray *)persistAddrs;
+- (void)espRescan;
+- (void)fovChanged:(UISegmentedControl *)sender;
+- (void)espRedraw;
+- (void)espTick;
+- (void)espRotated:(NSNotification *)note;
+- (void)espCaptureRoots:(const float *)roots
+                  count:(int)count
+                   camP:(const float *)camP
+               haveCamP:(bool)haveCamP
+                   camF:(const float *)camF
+               haveCamF:(bool)haveCamF;
 
 @end
 
@@ -1443,6 +1510,19 @@ stopped:
     _prevSelfP[0] = _prevSelfP[1] = _prevSelfP[2] = 0.0f;
     _prevSelfValid = NO;
     _humanPrev = [NSMutableSet set];
+
+    /* Round 28 ESP state. */
+    _espMode = NO;
+    _espEverScanned = NO;
+    _espFovIdx = ESP_FOV_DEFAULT;
+    _espStamp = 0.0;
+    _espRoots = NULL;
+    _espRootN = 0;
+    _espRootCap = 0;
+    _espHaveCam = NO;
+    _espCamP[0] = _espCamP[1] = _espCamP[2] = 0.0f;
+    _espCamF[0] = _espCamF[1] = _espCamF[2] = 0.0f;
+    _espTimer = nil;
 
     self.view.backgroundColor = [UIColor blackColor];
 
@@ -1503,10 +1583,37 @@ stopped:
     [_rescanButton addTarget:self action:@selector(rescan) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_rescanButton];
 
+    /* Round 28: ESP RESCAN sits under RE-RUN and runs the whole existing
+       pipeline; the FOV control sits under RESCAN and only redraws, using the
+       camera and humanoid roots the last scan cached. */
+    _espButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_espButton setTitle:@"ESP RESCAN" forState:UIControlStateNormal];
+    [_espButton setTitleColor:[UIColor cyanColor] forState:UIControlStateNormal];
+    _espButton.frame = CGRectMake(10.0, 52.0, 110.0, 30.0);
+    _espButton.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+    [_espButton addTarget:self action:@selector(espRescan) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_espButton];
+
+    NSArray *fovTitles = @[ @"40", @"60", @"80", @"90", @"100", @"110", @"120", @"130" ];
+    _fovControl = [[UISegmentedControl alloc] initWithItems:fovTitles];
+    _fovControl.frame = CGRectMake(self.view.bounds.size.width - 370.0, 52.0, 350.0, 28.0);
+    _fovControl.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+    _fovControl.selectedSegmentIndex = ESP_FOV_DEFAULT;
+    [_fovControl addTarget:self action:@selector(fovChanged:)
+         forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:_fovControl];
+
     [self.view bringSubviewToFront:_rerunButton];
+    [self.view bringSubviewToFront:_espButton];
     [self.view bringSubviewToFront:_rescanButton];
+    [self.view bringSubviewToFront:_fovControl];
     [self.view bringSubviewToFront:_stopButton];
     [self.view bringSubviewToFront:_exitButton];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(espRotated:)
+                                                 name:UIApplicationDidChangeStatusBarOrientationNotification
+                                               object:nil];
 }
 
 - (void)viewDidAppear:(BOOL)animated
@@ -1681,6 +1788,276 @@ stopped:
 {
     diag_log("diag: exit pressed");
     exit(0);
+}
+
+/* ---------------- ESP v1 ------------------------------------------------ */
+
+- (int)espFovDegrees
+{
+    static const int kFovs[ESP_FOV_COUNT] = { 40, 60, 80, 90, 100, 110, 120, 130 };
+    int i = _espFovIdx;
+    if (i < 0 || i >= ESP_FOV_COUNT)
+        i = ESP_FOV_DEFAULT;
+    return kFovs[i];
+}
+
+- (NSString *)espFovTag
+{
+    return [NSString stringWithFormat:@"F%d", [self espFovDegrees]];
+}
+
+/* ESP RESCAN: the additive button. Shows the overlay, then runs exactly the
+   pipeline RESCAN runs. The humanoid capture happens at the end of the TRS
+   pass; nothing else in the diagnostic changes. */
+- (void)espRescan
+{
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self espRescan]; });
+        return;
+    }
+
+    diag_log("diag: esp rescan pressed");
+
+    _espMode = YES;
+    _espEverScanned = NO;
+    _espStamp = 0.0;
+
+    OverlayWindow *overlay = [OverlayWindow shared];
+    [overlay espShow:YES];
+    [overlay espClear];
+    [overlay espSetRects:NULL distances:NULL count:0
+                  status:@"scanning..." fov:[self espFovTag]];
+
+    if (!_espTimer) {
+        _espTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                     target:self
+                                                   selector:@selector(espTick)
+                                                   userInfo:nil
+                                                    repeats:YES];
+    }
+
+    _textView.text = @"";
+    [self logLine:@"ESP RESCAN: pipeline start, fovX=%d", [self espFovDegrees]];
+    [self startRun];
+}
+
+/* FOV calibration: never re-reads the game. The cached roots and camera are
+   projected again with the new horizontal FOV. */
+- (void)fovChanged:(UISegmentedControl *)sender
+{
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self fovChanged:sender];
+        });
+        return;
+    }
+
+    int idx = (int)sender.selectedSegmentIndex;
+    if (idx < 0 || idx >= ESP_FOV_COUNT)
+        idx = ESP_FOV_DEFAULT;
+
+    _espFovIdx = idx;
+    diag_log("diag: fov changed");
+
+    [self logLine:@"ESP fovX=%d (redraw from cached scan)", [self espFovDegrees]];
+    [self espRedraw];
+}
+
+- (void)espTick
+{
+    if (!_espMode) {
+        [_espTimer invalidate];
+        _espTimer = nil;
+        return;
+    }
+    [self espRedraw];
+}
+
+- (void)espRotated:(NSNotification *)note
+{
+    if (!_espMode)
+        return;
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf espRedraw];
+    });
+}
+
+/* Worker thread: called at the end of the TRS pass with this scan's camera and
+   the accepted humanoid roots. Everything is copied, then the main thread
+   redraws. */
+- (void)espCaptureRoots:(const float *)roots
+                  count:(int)count
+                   camP:(const float *)camP
+               haveCamP:(bool)haveCamP
+                   camF:(const float *)camF
+               haveCamF:(bool)haveCamF
+{
+    BOOL hadFwd = _espHaveCam;
+    BOOL ok = NO;
+
+    /* Publish nothing until both camera and roots are consistent: a redraw
+       racing this method then sees an empty list instead of half an update. */
+    _espRootN = 0;
+    _espHaveCam = NO;
+
+    if (haveCamP && camP) {
+        memcpy(_espCamP, camP, sizeof(_espCamP));
+        if (haveCamF && camF) {
+            memcpy(_espCamF, camF, sizeof(_espCamF));
+            ok = YES;
+        } else if (hadFwd) {
+            /* Position refreshed, the cached forward is still the best guess. */
+            ok = YES;
+        }
+    }
+
+    if (count < 0)
+        count = 0;
+    if (count > ESP_MAX_BOXES)
+        count = ESP_MAX_BOXES;
+
+    if (count > _espRootCap) {
+        float *grown = (float *)realloc(_espRoots, (size_t)count * 3 * sizeof(float));
+        if (grown) {
+            _espRoots = grown;
+            _espRootCap = count;
+        } else {
+            count = 0;
+        }
+    }
+
+    if (count > 0 && roots)
+        memcpy(_espRoots, roots, (size_t)count * 3 * sizeof(float));
+
+    _espHaveCam = ok;
+    _espRootN = count;
+    _espStamp = CFAbsoluteTimeGetCurrent();
+    _espEverScanned = YES;
+
+    [self vlogLine:@"esp: cam=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) src=%s roots=%d",
+                _espCamP[0], _espCamP[1], _espCamP[2],
+                _espCamF[0], _espCamF[1], _espCamF[2],
+                ok ? (haveCamF ? "T" : "cache") : "none", count];
+
+    dispatch_async(dispatch_get_main_queue(), ^{ [self espRedraw]; });
+}
+
+/* Main thread: project the cached roots and paint the overlay. */
+- (void)espRedraw
+{
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self espRedraw]; });
+        return;
+    }
+
+    if (!_espMode)
+        return;
+
+    OverlayWindow *overlay = [OverlayWindow shared];
+    CGSize size = overlay.bounds.size;
+    if (size.width < 1.0 || size.height < 1.0)
+        size = [UIScreen mainScreen].bounds.size;
+
+    float W = (float)size.width;
+    float H = (float)size.height;
+    int fovDeg = [self espFovDegrees];
+
+    float half = (float)fovDeg * 0.5f * (float)M_PI / 180.0f;
+    float tanHalf = tanf(half);
+    if (!(tanHalf > 1e-4f))
+        tanHalf = 1e-4f;
+
+    float sx = (W * 0.5f) / tanHalf;
+    float cx = W * 0.5f;
+    float cy = H * 0.5f;
+
+    static float lastW = -1.0f;
+    static float lastH = -1.0f;
+    if (W != lastW || H != lastH) {
+        lastW = W;
+        lastH = H;
+        [self vlogLine:@"esp: overlay %.0fx%.0f fovX=%d scale=%.1f",
+                    W, H, fovDeg, sx];
+    }
+
+    if (!_espEverScanned) {
+        [overlay espSetRects:NULL distances:NULL count:0
+                      status:@"scanning..." fov:[self espFovTag]];
+        return;
+    }
+
+    double age = CFAbsoluteTimeGetCurrent() - _espStamp;
+
+    CGRect rects[ESP_MAX_BOXES];
+    float dists[ESP_MAX_BOXES];
+    int boxes = 0;
+
+    if (_espHaveCam && _espRootN > 0) {
+        const float *cam = _espCamP;
+
+        float fwd[3] = { _espCamF[0], _espCamF[1], _espCamF[2] };
+        float fl = sqrtf(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+        if (fl > 1e-4f) {
+            fwd[0] /= fl;
+            fwd[1] /= fl;
+            fwd[2] /= fl;
+        }
+
+        /* right = normalize(cross(fwd, (0,1,0))) = normalize(-fwd.z, 0, fwd.x) */
+        float right[3] = { -fwd[2], 0.0f, fwd[0] };
+        float rl = sqrtf(right[0] * right[0] + right[2] * right[2]);
+        if (rl > 1e-4f) {
+            right[0] /= rl;
+            right[2] /= rl;
+
+            /* upv = cross(right, fwd) */
+            float upv[3] = { right[1] * fwd[2] - right[2] * fwd[1],
+                             right[2] * fwd[0] - right[0] * fwd[2],
+                             right[0] * fwd[1] - right[1] * fwd[0] };
+
+            for (int i = 0; i < _espRootN && boxes < ESP_MAX_BOXES; i++) {
+                const float *root = _espRoots + (size_t)i * 3;
+                float crown[3] = { root[0], root[1] + ESP_BODY_HEIGHT, root[2] };
+                CGPoint bot;
+                CGPoint top;
+
+                if (!esp_project(root, cam, right, upv, fwd, sx, cx, cy, &bot))
+                    continue;
+                if (!esp_project(crown, cam, right, upv, fwd, sx, cx, cy, &top))
+                    continue;
+
+                float h = fabsf(top.y - bot.y);
+                if (h < ESP_MIN_BOX_PX)
+                    continue;
+
+                float w = h * ESP_BOX_WIDTH_RATIO;
+                rects[boxes] = CGRectMake(bot.x - w * 0.5f,
+                                          fminf(bot.y, top.y), w, h);
+
+                float dx = root[0] - cam[0];
+                float dy = root[1] - cam[1];
+                float dz = root[2] - cam[2];
+                dists[boxes] = sqrtf(dx * dx + dy * dy + dz * dz);
+                boxes++;
+            }
+        }
+    }
+
+    NSString *status = nil;
+
+    if (!_espHaveCam)
+        status = @"no camera this scan";
+    else if (boxes > 0)
+        status = [NSString stringWithFormat:@"%.1fs  %d boxes / FOV=%d",
+                                            age, boxes, fovDeg];
+    else
+        status = @"no skeletons this scan";
+
+    [overlay espSetRects:rects distances:dists count:boxes
+                  status:status fov:[self espFovTag]];
 }
 
 /* Worker queue: find and attach to Critical Ops, at most 30 attempts. */
@@ -2847,6 +3224,8 @@ stopped:
                  count:(int)count
                   camP:(const float *)camP
               haveCamP:(bool)haveCamP
+                  camF:(const float *)camF
+              haveCamF:(bool)haveCamF
           persistAddrs:(NSArray *)persistAddrs
 {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
@@ -3071,6 +3450,19 @@ stopped:
     NSMutableSet *humanNow = [NSMutableSet set];
     int humanHits = 0;
 
+    /* Round 28 ESP: the accepted roots, copied out for the overlay. Allocated
+       only in ESP mode, so a normal scan allocates nothing extra. */
+    float *espRoots = NULL;
+    int espRootN = 0;
+    int espRootCap = 0;
+
+    if (_espMode) {
+        espRootCap = ESP_MAX_BOXES;
+        espRoots = (float *)malloc((size_t)espRootCap * 3 * sizeof(float));
+        if (!espRoots)
+            espRootCap = 0;
+    }
+
     if (arrs) {
         for (int i = 0; i < narr; i++) {
             if (gStopRequested.load())
@@ -3093,6 +3485,13 @@ stopped:
                 continue;
 
             humanHits++;
+
+            if (espRoots && espRootN < espRootCap) {
+                espRoots[espRootN * 3 + 0] = root->px;
+                espRoots[espRootN * 3 + 1] = root->py;
+                espRoots[espRootN * 3 + 2] = root->pz;
+                espRootN++;
+            }
 
             NSNumber *bkey = [NSNumber numberWithUnsignedLongLong:arrs[i].base];
             BOOL stable = [_humanPrev containsObject:bkey];
@@ -3150,6 +3549,12 @@ stopped:
                 PLANET_HUMAN_HEADHI, (int)anchors.count];
 
     _humanPrev = humanNow;
+
+    /* ESP draws from this capture; the PROJ hunt below is unaffected. */
+    if (_espMode)
+        [self espCaptureRoots:espRoots count:espRootN camP:camP haveCamP:haveCamP
+                         camF:camF haveCamF:haveCamF];
+    free(espRoots);
 
     /* ---------------- PROJ hunt ----------------------------------------- */
 
@@ -3465,10 +3870,26 @@ stopped:
             haveSelfP = true;
     }
 
-    [self vlogLine:@"planetary: self V=0x%llx T=0x%llx P=(%.3f,%.3f,%.3f) %s",
+    /* Round 28: the camera forward vector is the next 16-byte row, T+0x130.
+       Kept separate from the position test so neither can invalidate the
+       other; ESP falls back to the cached forward when this read fails. */
+    float selfF[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    bool haveSelfF = false;
+
+    if (selfT && mr_read(task, selfT + 0x130, selfF, sizeof(selfF))) {
+        float fl = sqrtf(selfF[0] * selfF[0] + selfF[1] * selfF[1] +
+                         selfF[2] * selfF[2]);
+        if (isfinite(selfF[0]) && isfinite(selfF[1]) && isfinite(selfF[2]) &&
+            fl >= ESP_CAM_FWD_MIN && fl <= ESP_CAM_FWD_MAX)
+            haveSelfF = true;
+    }
+
+    [self vlogLine:@"planetary: self V=0x%llx T=0x%llx P=(%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f) %s%s",
                 (unsigned long long)_localV, (unsigned long long)selfT,
                 selfP[0], selfP[1], selfP[2],
-                haveSelfP ? "valid" : "unavailable"];
+                selfF[0], selfF[1], selfF[2],
+                haveSelfP ? "valid" : "unavailable",
+                haveSelfF ? " fwd" : " nofwd"];
 
     int entities = 0;
     int selfHits = 0;
@@ -3849,7 +4270,8 @@ stopped:
        screen for this scan. */
     if (!gStopRequested.load())
         [self runTrsHuntTask:task regions:sel count:nsel camP:selfP
-                     haveCamP:haveSelfP persistAddrs:persistAddrs];
+                     haveCamP:haveSelfP camF:selfF haveCamF:haveSelfF
+                 persistAddrs:persistAddrs];
 
     /* This scan's camera P becomes the GHOST reference for the next one. */
     if (haveSelfP) {
