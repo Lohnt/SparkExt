@@ -60,6 +60,18 @@
 #define ACTOR_SCAN_SIZE     0x148
 #define ACTOR_STRIDE        0x58ULL
 
+/* --- round 24: PLANETARY full-heap differential -------------------------- */
+#define PLANET_BLOCK        0x20ULL
+#define PLANET_CAP_BYTES    (320ULL * 1024ULL * 1024ULL)
+#define PLANET_REGION_MAX   8192
+#define PLANET_CHANGED_MAX  (2u * 1024u * 1024u)
+#define PLANET_WIN          0x60
+#define PLANET_WIN_BACK     0x20
+#define PLANET_SCREEN_ENT   60
+#define PLANET_SCREEN_CLU   40
+#define PLANET_CLUSTER_GAP  0x1000ULL
+#define PLANET_HASH_CHUNK   (1u << 20)
+
 /* --- il2cpp class metadata ---------------------------------------------- */
 #define ACTOR_NAME_EXPECT  "O7D1D7DB39"
 #define TD_UNITY_TRANSFORM 13036ULL
@@ -631,6 +643,134 @@ static int view_proj_ok(const float *m)
     return 0;
 }
 
+/* ------------------------------------------------------------ planetary */
+
+/* One hashed region of the planetary snapshot. The hash array is owned by the
+   snapshot and reused in place on the following scan (ring of one). */
+typedef struct {
+    uint64_t base;
+    uint64_t size;
+    uint16_t *hash;
+    uint32_t nblocks;
+} planet_region;
+
+/* Exactly the planetary position filter: finite, |x| and |z| inside [1,3000],
+   |y| <= 500. Softer than view_pos_ok on purpose - a live position may well
+   have |y| < 1. */
+static bool planet_pos_ok(const float *f)
+{
+    if (!isfinite(f[0]) || !isfinite(f[1]) || !isfinite(f[2]))
+        return false;
+
+    float ax = fabsf(f[0]);
+    float az = fabsf(f[2]);
+    if (ax < 1.0f || ax > 3000.0f)
+        return false;
+    if (az < 1.0f || az > 3000.0f)
+        return false;
+    if (fabsf(f[1]) > 500.0f)
+        return false;
+    return true;
+}
+
+/* 16-bit fingerprint of one 0x20 block: XOR-fold its eight u32 words. */
+static uint16_t planet_hash_block(const uint8_t *p)
+{
+    uint32_t h = 0;
+    for (int i = 0; i < 8; i++) {
+        uint32_t w = 0;
+        memcpy(&w, p + (size_t)i * 4, sizeof(w));
+        h ^= w;
+    }
+    return (uint16_t)(h ^ (h >> 16));
+}
+
+static int planet_cmp_size(const void *a, const void *b)
+{
+    const planet_region *ra = (const planet_region *)a;
+    const planet_region *rb = (const planet_region *)b;
+
+    if (ra->size < rb->size)
+        return -1;
+    if (ra->size > rb->size)
+        return 1;
+    return ra->base < rb->base ? -1 : (ra->base > rb->base ? 1 : 0);
+}
+
+static int planet_cmp_base(const void *a, const void *b)
+{
+    const planet_region *ra = (const planet_region *)a;
+    const planet_region *rb = (const planet_region *)b;
+    return ra->base < rb->base ? -1 : (ra->base > rb->base ? 1 : 0);
+}
+
+static int planet_cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a;
+    uint64_t y = *(const uint64_t *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+/* Regions are kept in base order, so lookup is a binary search. */
+static planet_region *planet_find(planet_region *regs, int n, uint64_t base)
+{
+    int lo = 0;
+    int hi = n - 1;
+
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (regs[mid].base == base)
+            return &regs[mid];
+        if (regs[mid].base < base)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return NULL;
+}
+
+/* Enumerates readable+writable regions of at least one block. Returns the
+   number collected, or -1 when STOP was pressed. */
+static int planet_collect(mach_port_t task, planet_region *out, int maxn)
+{
+    vm_address_t addr = 0;
+    int n = 0;
+
+    for (int guard = 0; guard < 1000000 && n < maxn; guard++) {
+        if (gStopRequested.load())
+            return -1;
+
+        vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t objectName = MACH_PORT_NULL;
+
+        memset(&info, 0, sizeof(info));
+        kern_return_t kr = vm_region_64(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &count, &objectName);
+        if (objectName != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), objectName);
+        if (kr != KERN_SUCCESS)
+            break;
+
+        if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE) &&
+            size >= PLANET_BLOCK) {
+            out[n].base = addr;
+            out[n].size = size;
+            out[n].hash = NULL;
+            out[n].nblocks = 0;
+            n++;
+        }
+
+        vm_address_t next = addr + size;
+        if (next <= addr)
+            break;
+        addr = next;
+    }
+
+    return n;
+}
+
 static const char *view_tag_name(uint8_t tag)
 {
     if (tag & VIEW_TAG_POS_START)
@@ -972,6 +1112,10 @@ stopped:
     NSMutableDictionary *_actorSlots;
     NSMutableDictionary *_tableSlots;
     int _scanCount;
+
+    /* Round 24: the planetary hash snapshot, kept across scans (ring of one). */
+    planet_region *_planetRegs;
+    int _planetNRegs;
 }
 
 - (void)appendLog:(NSString *)line;
@@ -1017,6 +1161,7 @@ stopped:
 - (void)runActorCensusTask:(mach_port_t)task
                 candidates:(const cand_t *)cands
                      count:(int)count;
+- (void)runPlanetaryTask:(mach_port_t)task;
 
 @end
 
@@ -1036,6 +1181,8 @@ stopped:
     _actorSlots = [NSMutableDictionary dictionary];
     _tableSlots = [NSMutableDictionary dictionary];
     _scanCount = 0;
+    _planetRegs = NULL;
+    _planetNRegs = 0;
 
     self.view.backgroundColor = [UIColor blackColor];
 
@@ -1456,7 +1603,7 @@ stopped:
     else
         snprintf(parentTxt, sizeof(parentTxt), "<none>");
 
-    [self logLine:@"discovery %s name=%s NAME_OFF=+0x%02llx PARENT_OFF=%s",
+    [self vlogLine:@"discovery %s name=%s NAME_OFF=+0x%02llx PARENT_OFF=%s",
                (haveName && parentOff) ? "PASS" : "FAIL",
                haveName ? actorName : "?", nameOff, parentTxt];
 
@@ -1499,13 +1646,13 @@ stopped:
     }
 
     if (tfFieldOff)
-        [self logLine:@"transform field = +0x%02llx td=%llu", tfFieldOff,
+        [self vlogLine:@"transform field = +0x%02llx td=%llu", tfFieldOff,
                    (unsigned long long)tfFieldTd];
     else
-        [self logLine:@"transform field = <none>"];
+        [self vlogLine:@"transform field = <none>"];
 
     if (count == 0) {
-        [self logLine:@"hunt complete: 0 objects / 0 quat / 0 pos / 0 int100"];
+        [self vlogLine:@"hunt complete: 0 objects / 0 quat / 0 pos / 0 int100"];
         return;
     }
 
@@ -1625,14 +1772,14 @@ stopped:
         return;
     }
 
-    /* ---------------- compact screen: one line per candidate ---------- */
+    /* ---------------- compact file summary: one line per candidate ----- */
     for (int i = 0; i < count; i++) {
-        [self logLine:@"cand[%d] V=0x%llx pos?=%d quat?=%d chg=%d td5878=(%d,%d,%d)",
+        [self vlogLine:@"cand[%d] V=0x%llx pos?=%d quat?=%d chg=%d td5878=(%d,%d,%d)",
                    i, candidates[i].v, candPos[i], candQuat[i], candChg[i],
                    candTd[i][0], candTd[i][1], candTd[i][2]];
     }
 
-    [self logLine:@"--- TOP by chg ---"];
+    [self vlogLine:@"--- TOP by chg ---"];
 
     int top[TOP_CANDIDATES];
     int topN = 0;
@@ -1655,9 +1802,7 @@ stopped:
         rankChg[best] = -1;
     }
 
-    int screenLeft = SCREEN_TOP_LINES;
-
-    for (int s = 0; s < topN && screenLeft > 0; s++) {
+    for (int s = 0; s < topN; s++) {
         int i = top[s];
         uint64_t v = candidates[i].v;
 
@@ -1680,28 +1825,24 @@ stopped:
         int stats[6] = { 0, 0, 0, 0, 0, 0 };
         [self diffHits:hits count:hc objs:objs prev:prevCache next:nil stats:stats];
 
-        [self logLine:@"cand[%d] V=0x%llx objs=%d chg=%d", i, v, nobj, stats[5]];
+        [self vlogLine:@"cand[%d] V=0x%llx objs=%d chg=%d", i, v, nobj, stats[5]];
 
         static const int order[3] = { DIFF_CHANGED, DIFF_SAME, DIFF_NEW };
-        for (int pass = 0; pass < 3 && screenLeft > 0; pass++) {
-            for (int k = 0; k < hc && screenLeft > 0; k++) {
+        for (int pass = 0; pass < 3; pass++) {
+            for (int k = 0; k < hc; k++) {
                 if (hits[k].diff != order[pass])
                     continue;
                 if (hits[k].kind == HUNT_INT100)
                     continue;
-                [self logLine:@"%@", [self hitLine:&hits[k] objs:objs]];
-                screenLeft--;
+                [self vlogLine:@"%@", [self hitLine:&hits[k] objs:objs]];
             }
         }
     }
 
-    if (screenLeft <= 0)
-        [self logLine:@"  ... TOP block truncated; full hits in diag_scan.log"];
-
     _hitCache = newCache;
 
-    [self logLine:@"hunt complete: %d objects / %d quat / %d pos / %d int100",
-               totalObjs, totalQuat, totalPos, totalInt];
+    [self vlogLine:@"hunt complete: %d objects / %d quat / %d pos / %d int100",
+                totalObjs, totalQuat, totalPos, totalInt];
     [self vlogLine:@"diff: %d changed of %d hits across %d candidates",
                 totalChg, totalQuat + totalPos + totalInt, count];
 
@@ -1712,6 +1853,9 @@ stopped:
 
     if (!gStopRequested.load())
         [self runActorCensusTask:task candidates:candidates count:count];
+
+    if (!gStopRequested.load())
+        [self runPlanetaryTask:task];
 
     free(objs);
     free(hits);
@@ -1733,7 +1877,7 @@ stopped:
                    count:(int)count
                  candChg:(const int *)candChg
 {
-    [self logLine:@"--- VIEW phase ---"];
+    [self vlogLine:@"--- VIEW phase ---"];
 
     /* Item 5: identify the first node of the +0x58-stride actor run. */
     [self viewDumpSpineTask:task meta:ctx->metadata_base candidates:cands
@@ -1760,8 +1904,8 @@ stopped:
     memset(&vs, 0, sizeof(vs));
 
     if (localIdx < 0) {
-        [self logLine:@"view: no config-linked candidate"];
-        [self logLine:@"view: %d slots / %d pos / %d dir / %d mat (%d changed)",
+        [self vlogLine:@"view: no config-linked candidate"];
+        [self vlogLine:@"view: %d slots / %d pos / %d dir / %d mat (%d changed)",
                    vs.slots, vs.pos, vs.dir, vs.mat, vs.changed];
         return;
     }
@@ -1802,7 +1946,7 @@ stopped:
                           VIEW_REGION_MAX, tObj, "T");
         tRegs = nregs;
     } else {
-        [self logLine:@"view: T = 0 (V+0x%02x unreadable)", VIEW_OFF_FIELD];
+        [self vlogLine:@"view: T = 0 (V+0x%02x unreadable)", VIEW_OFF_FIELD];
     }
 
     if (cfgObj) {
@@ -1840,10 +1984,10 @@ stopped:
         _viewSlots = next;
 
     if (left <= 0)
-        [self logLine:@"  ... view block truncated; full hits in diag_scan.log"];
+        [self vlogLine:@"  ... view block truncated; full hits in diag_scan.log"];
 
-    [self logLine:@"view: %d slots / %d pos / %d dir / %d mat (%d changed)",
-               vs.slots, vs.pos, vs.dir, vs.mat, vs.changed];
+    [self vlogLine:@"view: %d slots / %d pos / %d dir / %d mat (%d changed)",
+                vs.slots, vs.pos, vs.dir, vs.mat, vs.changed];
     [self vlogLine:@"view mat2 = %d / new slots = %d", vs.mat2, vs.added];
 
     if (stopped)
@@ -2076,13 +2220,13 @@ stopped:
                 reg->path, (unsigned long long)reg->addr, have, nslots,
                 rpos, rdir, rmat, rmat2, rchg];
 
-    /* File-only probe of the run #22 anchors: view position and direction. */
+    /* The T probe stays on screen: it is the only live view-state readout. */
     if (probe && reg->addr == probe) {
         for (int off = 0x120; off <= 0x130; off += 0x10) {
             int i = off / 4;
             if (i + 3 >= nslots)
                 continue;
-            [self vlogLine:@"VIEW probe T+0x%03x = (%.4f,%.4f,%.4f,%.4f) tag=%s",
+            [self logLine:@"VIEW probe T+0x%03x = (%.4f,%.4f,%.4f,%.4f) tag=%s",
                         off, fv[i], fv[i + 1], fv[i + 2], fv[i + 3],
                         view_tag_name(tag[i])];
         }
@@ -2133,9 +2277,9 @@ stopped:
         if (!(tag[i] & (VIEW_TAG_MAT2_POS | VIEW_TAG_MAT2_NEG)))
             continue;
 
-        /* MAT2 goes to the screen unconditionally: it is the rare projection
-           signature the census needs, so the 60-line budget does not apply. */
-        [self logLine:@"VIEW MAT2 %s +0x%03x  %8.3f %8.3f %8.3f %8.3f | "
+        /* MAT2 goes to the file: the projection signature stays visible even
+           when the screen shows only the planetary block. */
+        [self vlogLine:@"VIEW MAT2 %s +0x%03x  %8.3f %8.3f %8.3f %8.3f | "
                     @"%8.3f %8.3f %8.3f %8.3f | "
                     @"%8.3f %8.3f %8.3f %8.3f | "
                     @"%8.3f %8.3f %8.3f %8.3f  [row3 %s]",
@@ -2153,15 +2297,12 @@ stopped:
     free(chg);
 }
 
-/* Screen while the 60-line budget lasts, verbose file always. */
+/* VIEW detail is file only now; the screen keeps coverage, the T probe, the
+   census totals and the planetary block. */
 - (void)viewEmit:(NSString *)line screenLeft:(int *)left
 {
-    if (left && *left > 0) {
-        [self logLine:@"%@", line];
-        (*left)--;
-    } else {
-        [self vlogLine:@"%@", line];
-    }
+    (void)left;
+    [self vlogLine:@"%@", line];
 }
 
 /* Hex + float rows for a raw dump; file only. */
@@ -2200,7 +2341,7 @@ stopped:
     size_t have = hunt_read_obj(task, tObj, raw, VIEW_SCAN_SIZE);
     int nslots = (int)(have / 4);
 
-    [self logLine:@"T block T=0x%llx read=0x%zx slots=%d",
+    [self vlogLine:@"T block T=0x%llx read=0x%zx slots=%d",
                (unsigned long long)tObj, have, nslots];
     if (nslots < 4)
         return;
@@ -2214,8 +2355,8 @@ stopped:
         int i = off / 4;
         if (i + 3 >= nslots)
             break;
-        [self logLine:@"T+0x%03x  %9.4f %9.4f %9.4f %9.4f",
-                   off, fv[i], fv[i + 1], fv[i + 2], fv[i + 3]];
+        [self vlogLine:@"T+0x%03x  %9.4f %9.4f %9.4f %9.4f",
+                    off, fv[i], fv[i + 1], fv[i + 2], fv[i + 3]];
     }
 
     int vecs = 0;
@@ -2223,10 +2364,10 @@ stopped:
         if (!view_dir_ok(fv + i, NULL))
             continue;
         vecs++;
-        [self logLine:@"VEC T+0x%03x  (%9.4f,%9.4f,%9.4f, %9.4f)",
-                   i * 4, fv[i], fv[i + 1], fv[i + 2], fv[i + 3]];
+        [self vlogLine:@"VEC T+0x%03x  (%9.4f,%9.4f,%9.4f, %9.4f)",
+                    i * 4, fv[i], fv[i + 1], fv[i + 2], fv[i + 3]];
     }
-    [self logLine:@"T vec3 count = %d", vecs];
+    [self vlogLine:@"T vec3 count = %d", vecs];
 }
 
 /* Item 4: snapshot of the table hanging off T+0xb0. Full hex+float dump to the
@@ -2240,7 +2381,7 @@ stopped:
                   src:(const char *)src
 {
     if (!base) {
-        [self logLine:@"table: none (T+0x%02x = 0)", TABLE_OFF_FIELD];
+        [self vlogLine:@"table: none (T+0x%02x = 0)", TABLE_OFF_FIELD];
         return;
     }
 
@@ -2274,13 +2415,11 @@ stopped:
         next[key] = [NSNumber numberWithUnsignedInt:bits];
     }
 
-    [self logLine:@"table X=0x%llx src=%s read=0x%zx slots=%d class=0x%llx name=%s chg=%d",
+    [self vlogLine:@"table X=0x%llx src=%s read=0x%zx slots=%d class=0x%llx name=%s chg=%d",
                (unsigned long long)base, src, have, nslots,
                (unsigned long long)cls, clsName[0] ? clsName : "?", chg];
 
     [self viewDumpRows:raw have:have label:"TBL"];
-
-    int shown = 0;
 
     for (int i = 0; i < nslots; i++) {
         uint32_t bits = 0;
@@ -2301,35 +2440,30 @@ stopped:
         memcpy(&oldF, &oldBits, sizeof(oldF));
         memcpy(&newF, &bits, sizeof(newF));
 
-        if (shown < TABLE_SCREEN_CHG) {
-            [self logLine:@"  table chg +0x%03x  %.4f -> %.4f", i * 4, oldF, newF];
-            shown++;
-        } else {
-            [self vlogLine:@"  table chg +0x%03x  %.4f -> %.4f", i * 4, oldF, newF];
-        }
+        [self vlogLine:@"  table chg +0x%03x  %.4f -> %.4f", i * 4, oldF, newF];
     }
 
     if (have == 0) {
-        [self logLine:@"table: unreadable at 0x%llx", (unsigned long long)base];
+        [self vlogLine:@"table: unreadable at 0x%llx", (unsigned long long)base];
     } else if (chg == 0) {
         if (_scanCount >= 3)
-            [self logLine:@"table: FROZEN (chg=0 in scan %d)", _scanCount];
+            [self vlogLine:@"table: FROZEN (chg=0 in scan %d)", _scanCount];
         else
-            [self logLine:@"table: chg=0 (scan %d, baseline)", _scanCount];
+            [self vlogLine:@"table: chg=0 (scan %d, baseline)", _scanCount];
     } else if (chg > TABLE_SCREEN_CHG) {
-        [self logLine:@"table: %d more changed slots in diag_scan.log",
-                   chg - TABLE_SCREEN_CHG];
+        [self vlogLine:@"table: %d more changed slots in diag_scan.log",
+                    chg - TABLE_SCREEN_CHG];
     }
 }
 
-/* Item 3: census over every K1779 hit. Each actor gets one line (file always,
-   screen when it has changes); its first 0x148 bytes are diffed slot by slot,
-   and the changed slots are listed in the file. */
+/* Item 3: census over every K1779 hit. Each actor gets one line in the file;
+   its first 0x148 bytes are diffed slot by slot, changed slots are listed in the
+   file, and only the totals stay on screen. */
 - (void)runActorCensusTask:(mach_port_t)task
                 candidates:(const cand_t *)cands
                      count:(int)count
 {
-    [self logLine:@"--- actor census ---"];
+    [self vlogLine:@"--- actor census ---"];
 
     NSDictionary *prev = _actorSlots ?: [NSDictionary dictionary];
     NSMutableDictionary *next = [NSMutableDictionary dictionaryWithCapacity:8192];
@@ -2400,12 +2534,11 @@ stopped:
                           inRun, (int)(int32_t)t0, (int)(int32_t)t1,
                           (int)(int32_t)t2, have, chg];
 
+        [self vlogLine:@"%@", line];
+
         if (chg > 0) {
-            [self logLine:@"%@", line];
             changedActors++;
             changedSlots += chg;
-        } else {
-            [self vlogLine:@"%@", line];
         }
 
         for (int s = 0; s < nslots; s++) {
@@ -2437,6 +2570,361 @@ stopped:
 
     if (stopped)
         [self logLine:@"scan stopped"];
+}
+
+/* ---------------- PLANETARY full-heap differential ---------------------- */
+
+/* Two-pass, whole-heap differential. Pass A enumerates every readable+writable
+   region, fingerprints each 0x20 block into a 16-bit hash and stores the hash
+   snapshot (capped at 320 MB of hash arrays, largest regions dropped first).
+   Pass B, later in the same scan, diffs those hashes against the snapshot the
+   previous scan left behind - region for region, skipping any region whose
+   base/size no longer matches - and collects the changed block addresses.
+   The hash arrays are then reused in place, so exactly one snapshot is ever
+   live (ring of one). Changed blocks are re-read as 0x60 windows and scored for
+   the position+unit-vector pair that identifies a live entity. */
+- (void)runPlanetaryTask:(mach_port_t)task
+{
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+
+    planet_region *cand = (planet_region *)calloc(PLANET_REGION_MAX, sizeof(planet_region));
+    if (!cand) {
+        [self logLine:@"PLANETARY A failed: out of memory"];
+        return;
+    }
+
+    int ncand = planet_collect(task, cand, PLANET_REGION_MAX);
+    if (ncand < 0) {
+        free(cand);
+        [self logLine:@"scan stopped"];
+        return;
+    }
+
+    if (ncand >= PLANET_REGION_MAX)
+        [self vlogLine:@"planetary: region cap hit (%d); rest of the heap not enumerated",
+                    PLANET_REGION_MAX];
+
+    /* Smallest first, so the 320 MB budget is spent on many small regions
+       before any single huge one, and the largest are the ones dropped. */
+    qsort(cand, (size_t)ncand, sizeof(planet_region), planet_cmp_size);
+
+    planet_region *sel = (planet_region *)calloc(PLANET_REGION_MAX, sizeof(planet_region));
+    if (!sel) {
+        free(cand);
+        [self logLine:@"PLANETARY A failed: out of memory"];
+        return;
+    }
+
+    uint64_t skippedBytes = 0;
+    uint64_t skippedRegions = 0;
+    uint64_t hashBytes = 0;
+    int nsel = 0;
+
+    for (int i = 0; i < ncand; i++) {
+        uint64_t nblocks = cand[i].size / PLANET_BLOCK;
+        uint64_t need = nblocks * sizeof(uint16_t);
+
+        if (hashBytes + need > PLANET_CAP_BYTES) {
+            skippedRegions++;
+            skippedBytes += cand[i].size;
+            continue;
+        }
+
+        sel[nsel++] = cand[i];
+        hashBytes += need;
+    }
+
+    free(cand);
+
+    /* Base order so the old snapshot can be binary-searched. */
+    qsort(sel, (size_t)nsel, sizeof(planet_region), planet_cmp_base);
+
+    if (skippedRegions) {
+        [self vlogLine:@"planetary: skipped %llu largest regions / %llu bytes (cap %llu MB)",
+                    (unsigned long long)skippedRegions,
+                    (unsigned long long)skippedBytes,
+                    (unsigned long long)(PLANET_CAP_BYTES / (1024ULL * 1024ULL))];
+    }
+
+    uint8_t *chunk = (uint8_t *)malloc(PLANET_HASH_CHUNK);
+    uint64_t *chg = (uint64_t *)malloc((size_t)PLANET_CHANGED_MAX * sizeof(uint64_t));
+
+    if (!chunk || !chg) {
+        free(chunk);
+        free(chg);
+        free(sel);
+        [self logLine:@"PLANETARY A failed: out of memory"];
+        return;
+    }
+
+    bool havePrev = (_planetNRegs > 0 && _planetRegs != NULL);
+    uint64_t totalBlocks = 0;
+    uint64_t hashedBytes = 0;
+    uint64_t changed = 0;
+    uint64_t chgHead = 0;
+    uint32_t chgStored = 0;
+    int mismatched = 0;
+    int unreadableChunks = 0;
+    bool stopped = false;
+
+    for (int i = 0; i < nsel; i++) {
+        if (gStopRequested.load()) {
+            stopped = true;
+            break;
+        }
+
+        planet_region *r = &sel[i];
+        r->nblocks = (uint32_t)(r->size / PLANET_BLOCK);
+
+        planet_region *old = havePrev ? planet_find(_planetRegs, _planetNRegs, r->base) : NULL;
+        bool match = (old && old->size == r->size && old->hash &&
+                      old->nblocks == r->nblocks);
+
+        if (match) {
+            /* Take the old array over and refill it in place: ring of one. */
+            r->hash = old->hash;
+            old->hash = NULL;
+        } else {
+            if (havePrev) {
+                mismatched++;
+                [self vlogLine:@"planetary: region 0x%llx size=0x%llx has no predecessor, skipped",
+                            (unsigned long long)r->base, (unsigned long long)r->size];
+            }
+            r->hash = (uint16_t *)malloc((size_t)r->nblocks * sizeof(uint16_t));
+        }
+
+        if (!r->hash) {
+            unreadableChunks++;
+            continue;
+        }
+
+        if (!match)
+            memset(r->hash, 0, (size_t)r->nblocks * sizeof(uint16_t));
+
+        uint64_t done = 0;
+
+        while (done < r->size) {
+            if (gStopRequested.load()) {
+                stopped = true;
+                break;
+            }
+
+            uint64_t left = r->size - done;
+            size_t want = (size_t)(left < (uint64_t)PLANET_HASH_CHUNK ? left : (uint64_t)PLANET_HASH_CHUNK);
+            want &= ~(size_t)(PLANET_BLOCK - 1);
+            if (want == 0)
+                break;
+
+            uint16_t *h = r->hash + (size_t)(done / PLANET_BLOCK);
+
+            if (mr_read(task, r->base + done, chunk, want)) {
+                size_t nb = want / (size_t)PLANET_BLOCK;
+
+                for (size_t b = 0; b < nb; b++) {
+                    uint16_t hv = planet_hash_block(chunk + b * (size_t)PLANET_BLOCK);
+
+                    if (match && h[b] != hv) {
+                        changed++;
+                        chg[chgHead % PLANET_CHANGED_MAX] =
+                            r->base + (done / PLANET_BLOCK + (uint64_t)b) * PLANET_BLOCK;
+                        chgHead++;
+                        if (chgStored < PLANET_CHANGED_MAX)
+                            chgStored++;
+                    }
+
+                    h[b] = hv;
+                }
+            } else {
+                /* Leave the previous hashes alone: zeroing them would report
+                   every block in this chunk as changed next time. */
+                unreadableChunks++;
+            }
+
+            done += want;
+        }
+
+        if (stopped)
+            break;
+
+        totalBlocks += r->nblocks;
+        hashedBytes += r->size;
+    }
+
+    if (stopped) {
+        /* The snapshot is half-refilled; it cannot be used as a baseline. */
+        for (int i = 0; i < nsel; i++)
+            free(sel[i].hash);
+        free(sel);
+        if (havePrev) {
+            for (int i = 0; i < _planetNRegs; i++)
+                free(_planetRegs[i].hash);
+        }
+        free(_planetRegs);
+        _planetRegs = NULL;
+        _planetNRegs = 0;
+        free(chunk);
+        free(chg);
+        [self logLine:@"scan stopped"];
+        return;
+    }
+
+    double elapsedA = CFAbsoluteTimeGetCurrent() - t0;
+
+    /* Rows whose old hash was never claimed belong to regions that vanished. */
+    int removed = 0;
+    if (havePrev) {
+        for (int i = 0; i < _planetNRegs; i++) {
+            if (_planetRegs[i].hash) {
+                free(_planetRegs[i].hash);
+                removed++;
+            }
+        }
+    }
+    free(_planetRegs);
+
+    [self logLine:@"PLANETARY A regions=%d blocks=%llu MB=%.1f elapsed=%.2f skippedMB=%.1f",
+               nsel, (unsigned long long)totalBlocks,
+               (double)hashedBytes / (1024.0 * 1024.0), elapsedA,
+               (double)skippedBytes / (1024.0 * 1024.0)];
+
+    [self vlogLine:@"planetary: hash=%.1f MB / mismatch=%d / removed=%d / unreadable=%d / %s",
+                (double)hashBytes / (1024.0 * 1024.0), mismatched, removed,
+                unreadableChunks, havePrev ? "diff vs previous scan" : "baseline scan"];
+
+    free(chunk);
+
+    /* ---------------- entity extraction over changed blocks ------------ */
+    int entities = 0;
+    int clusters = 0;
+    int entScreen = 0;
+    uint64_t *entAddrs = NULL;
+    int entN = 0;
+
+    if (chgStored > 0) {
+        entAddrs = (uint64_t *)malloc((size_t)chgStored * sizeof(uint64_t));
+        NSMutableSet *seen = [NSMutableSet setWithCapacity:1024];
+        uint8_t win[PLANET_WIN];
+
+        for (uint32_t i = 0; i < chgStored; i++) {
+            if (gStopRequested.load())
+                break;
+
+            uint64_t blockAddr = chg[(chgHead - chgStored + i) % PLANET_CHANGED_MAX];
+            if (blockAddr < PLANET_WIN_BACK)
+                continue;
+
+            uint64_t wbase = blockAddr - PLANET_WIN_BACK;
+            memset(win, 0, sizeof(win));
+            size_t have = hunt_read_obj(task, wbase, win, PLANET_WIN);
+            if (have < 16)
+                continue;
+
+            int nf = (int)((have & ~(size_t)3) / 4);
+            float f[PLANET_WIN / 4];
+            memcpy(f, win, (size_t)nf * sizeof(float));
+
+            int posOff = -1;
+            for (int o = 0; o + 3 <= nf; o++) {
+                if (planet_pos_ok(f + o)) {
+                    posOff = o;
+                    break;
+                }
+            }
+            if (posOff < 0)
+                continue;
+
+            int dirOff = -1;
+            for (int o = 0; o + 3 <= nf; o++) {
+                if (o >= posOff - 8 && o <= posOff + 8)
+                    continue;
+                if (view_dir_ok(f + o, NULL)) {
+                    dirOff = o;
+                    break;
+                }
+            }
+            if (dirOff < 0)
+                continue;
+
+            /* Adjacent changed blocks find the same triple; dedupe on the
+               absolute position address. */
+            uint64_t posAddr = wbase + (uint64_t)posOff * 4;
+            NSNumber *key = [NSNumber numberWithUnsignedLongLong:posAddr];
+
+            if (seen.count < 200000) {
+                if ([seen containsObject:key])
+                    continue;
+                [seen addObject:key];
+            }
+
+            entities++;
+
+            NSString *line = [NSString stringWithFormat:
+                              @"ENT 0x%llx pos=(%.3f,%.3f,%.3f) dir=(%.3f,%.3f,%.3f)",
+                              (unsigned long long)blockAddr,
+                              f[posOff], f[posOff + 1], f[posOff + 2],
+                              f[dirOff], f[dirOff + 1], f[dirOff + 2]];
+
+            if (entScreen < PLANET_SCREEN_ENT) {
+                [self logLine:@"%@", line];
+                entScreen++;
+            } else {
+                [self vlogLine:@"%@", line];
+            }
+
+            [self vlogLine:@"ENT WIN 0x%llx pos+0x%03x dir+0x%03x",
+                        (unsigned long long)wbase, (unsigned)(posOff * 4),
+                        (unsigned)(dirOff * 4)];
+            [self viewDumpRows:win have:have label:"ENT"];
+
+            if (entAddrs && entN < (int)chgStored)
+                entAddrs[entN++] = blockAddr;
+        }
+
+        /* An entity table shows up as one dense cluster: group candidates whose
+           addresses are within 0x1000 of the neighbour. */
+        if (entN > 1) {
+            qsort(entAddrs, (size_t)entN, sizeof(uint64_t), planet_cmp_u64);
+
+            int start = 0;
+            int cluScreen = 0;
+
+            for (int i = 1; i <= entN; i++) {
+                if (i < entN && entAddrs[i] - entAddrs[i - 1] <= PLANET_CLUSTER_GAP)
+                    continue;
+
+                clusters++;
+
+                NSString *line = [NSString stringWithFormat:@"cluster base=0x%llx count=%d",
+                                  (unsigned long long)entAddrs[start], i - start];
+                if (cluScreen < PLANET_SCREEN_CLU) {
+                    [self logLine:@"%@", line];
+                    cluScreen++;
+                } else {
+                    [self vlogLine:@"%@", line];
+                }
+                start = i;
+            }
+        } else if (entN == 1) {
+            clusters = 1;
+            [self logLine:@"cluster base=0x%llx count=1",
+                       (unsigned long long)entAddrs[0]];
+        }
+    }
+
+    [self logLine:@"PLANETARY B changed=%llu entities=%d clusters=%d",
+               (unsigned long long)changed, entities, clusters];
+
+    if (changed > PLANET_CHANGED_MAX) {
+        [self vlogLine:@"planetary: changed ring kept last %u of %llu blocks",
+                    PLANET_CHANGED_MAX, (unsigned long long)changed];
+    }
+
+    free(entAddrs);
+    free(chg);
+
+    /* Ring of one: this scan's hashes become the next scan's baseline. */
+    _planetRegs = sel;
+    _planetNRegs = nsel;
 }
 
 @end
