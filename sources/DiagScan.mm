@@ -1117,9 +1117,11 @@ static bool human_owner_root(mach_port_t task, uint64_t base, float *out,
                 continue;
             if (!human_world_pos_ok(pos))
                 continue;
+            if (fabsf(pos[1]) > 5.0f)
+                continue;   /* skybox / flying transform, not a ground actor */
 
             xz = sqrtf(pos[0] * pos[0] + pos[2] * pos[2]);
-            if (xz < 1.0f)
+            if (xz < 0.5f)
                 continue;
 
             memcpy(out, pos, sizeof(pos));
@@ -1156,15 +1158,19 @@ static bool human_owner_root(mach_port_t task, uint64_t base, float *out,
     return false;
 }
 
-/* Round 39: a world root is a TRS row that is not at/near the origin and not
-   the camera itself, which is what the old nearest-slot pairing kept picking. */
+/* Round 42: a bind-skeleton root must be an actor on the map, not a skybox,
+   camera or model-space row. Ground actors sit at |y| <= 5; the 24 m skybox
+   transform is the failure this rejects. */
 static bool human_root_pos_ok(const float *p, const float *camP)
 {
     if (!human_world_pos_ok(p))
         return false;
 
+    if (fabsf(p[1]) > 5.0f)
+        return false;
+
     float xz = sqrtf(p[0] * p[0] + p[2] * p[2]);
-    if (xz < 1.0f)
+    if (xz < 0.5f)
         return false;
 
     if (camP) {
@@ -1265,19 +1271,18 @@ static bool human_near_trs(mach_port_t task, uint64_t base, int rows,
     return hit;
 }
 
-/* Round 41: last resort pairing. Same filters as the near scan, but over every
-   TRS slot the pass collected. The address window is 16 MB because a bind
-   skeleton's live root Transform can sit far from the cached model array;
-   address-nearest still prefers the actor's own component cluster. Near-origin
-   rows, the camera row and roots already claimed by another skeleton are
-   rejected. */
+/* Round 42: last resort pairing. Same filters as the near scan, but over every
+   TRS slot the pass collected within 64 KB. The 16 MB window let a skybox
+   transform 0x44a00 away win; distance and height filters now reject it.
+   Near-origin rows, the camera row and roots already claimed by another
+   skeleton are rejected. */
 static bool human_nearest_slot(const trs_slot *slots, int nslots, uint64_t base,
                                int rows, const float *camP,
                                const uint64_t *used, int usedN,
                                float *out, uint64_t *srcOut,
                                uint64_t *distOut)
 {
-    const uint64_t maxDist = 0x1000000ULL;   /* 16 MB */
+    const uint64_t maxDist = 0x10000ULL;   /* 64 KB: farther matches are props */
 
     if (!slots || nslots <= 0 || !out)
         return false;
@@ -3622,6 +3627,7 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
     NSMutableSet *humanNow = [NSMutableSet set];
     int humanHits = 0;
     int humanBind = 0;
+    int humanCull = 0;
 
     /* Round 29 ESP: one camera decision per scan, then the roots below. Both go
        into the worker-owned staging buffer; nothing the overlay reads is written
@@ -3779,12 +3785,35 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
 
             humanHits++;
 
-            [self vlogLine:@"human: root=0x%llx bind=%d src=%s slots=%d dist=0x%llx P=(%.3f,%.3f,%.3f)",
+            /* Round 42: the ESP only draws actors within 50 m. Without this
+               the scan staged every map prop and the overlay filled with
+               boxes for enemies the user could not see. */
+            float camDist = -1.0f;
+            BOOL culled = NO;
+            char culltag[48];
+
+            culltag[0] = '\0';
+
+            if (drawable && haveCamP) {
+                float dx = rootP[0] - camP[0];
+                float dy = rootP[1] - camP[1];
+                float dz = rootP[2] - camP[2];
+
+                camDist = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (camDist > 50.0f) {
+                    culled = YES;
+                    humanCull++;
+                    snprintf(culltag, sizeof(culltag), " culled=1 dist=%.1f",
+                             camDist);
+                }
+            }
+
+            [self vlogLine:@"human: root=0x%llx bind=%d src=%s slots=%d dist=0x%llx P=(%.3f,%.3f,%.3f)%s",
                         rootAddr, bind ? 1 : 0, rootsrc, arrs[i].count,
                         (unsigned long long)dist,
-                        rootP[0], rootP[1], rootP[2]];
+                        rootP[0], rootP[1], rootP[2], culltag];
 
-            if (drawable && _espMode && _espStageN < ESP_MAX_BOXES) {
+            if (drawable && !culled && _espMode && _espStageN < ESP_MAX_BOXES) {
                 _espStageRoots[_espStageN * 3 + 0] = rootP[0];
                 _espStageRoots[_espStageN * 3 + 1] = rootP[1];
                 _espStageRoots[_espStageN * 3 + 2] = rootP[2];
@@ -3835,9 +3864,10 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
 
     _espStageBind = _espMode ? humanBind : 0;
 
-    [self vlogLine:@"human: %d arrays (>=%d slots, head y %.2f..%.2f) bind=%d / %d anchors",
+    [self vlogLine:@"human: %d arrays (>=%d slots, head y %.2f..%.2f) bind=%d culled=%d / %d anchors",
                 humanHits, PLANET_HUMAN_MIN, PLANET_HUMAN_HEADLO,
-                PLANET_HUMAN_HEADHI, humanBind, (int)anchors.count];
+                PLANET_HUMAN_HEADHI, humanBind, humanCull,
+                (int)anchors.count];
 
     _humanPrev = humanNow;
 
