@@ -1107,46 +1107,122 @@ static bool human_owner_root(mach_port_t task, uint64_t base, float *out,
     return false;
 }
 
-/* Wider companion scan: a TRS-qualified, in-map, non-zero row in the 0x1000
-   bytes before the chain. Covers actors whose root transform sits further back
-   than the 0x200 window used since round 30. */
-static bool human_wide_pre(mach_port_t task, uint64_t base, float *out,
-                           uint64_t *srcOut)
+/* Round 39: a world root is a TRS row that is not at/near the origin and not
+   the camera itself, which is what the old nearest-slot pairing kept picking. */
+static bool human_root_pos_ok(const float *p, const float *camP)
 {
-    const uint64_t win = 0x4000;
-
-    if (!out || base <= win)
+    if (!human_world_pos_ok(p))
         return false;
 
-    uint8_t buf[0x4000];
-    memset(buf, 0, sizeof(buf));
-    size_t got = hunt_read_obj(task, base - win, buf, sizeof(buf));
-    if (got < 0x30)
+    float xz = sqrtf(p[0] * p[0] + p[2] * p[2]);
+    if (xz < 1.0f)
         return false;
 
-    for (int off = (int)(got - 0x30); off >= 0; off -= PLANET_HUMAN_PRE_STEP) {
-        float pos[3];
-
-        if (!planet_trs_ok(buf + off, pos))
-            continue;
-        if (!human_world_pos_ok(pos))
-            continue;
-
-        memcpy(out, pos, sizeof(pos));
-        if (srcOut)
-            *srcOut = base - win + (uint64_t)off;
-        return true;
+    if (camP) {
+        float dx = p[0] - camP[0];
+        float dy = p[1] - camP[1];
+        float dz = p[2] - camP[2];
+        if (sqrtf(dx * dx + dy * dy + dz * dz) < 1.0f)
+            return false;
     }
 
-    return false;
+    return true;
 }
 
-/* Round 38: last resort pairing. A bind chain carries no world position, but
-   the TRS pass already collected every in-map transform near it; the actor's
-   root is the closest slot outside the skeleton. Distance is logged so a wrong
-   pairing is visible. */
+/* Wider companion scan: a filtered TRS row in the 64 KB before the chain, then
+   in the 64 KB after it (past the skeleton rows). Nearest address first. */
+static bool human_near_trs(mach_port_t task, uint64_t base, int rows,
+                           const float *camP, const uint64_t *used, int usedN,
+                           float *out, uint64_t *srcOut, uint64_t *distOut)
+{
+    const uint64_t win = 0x10000;
+    uint8_t *buf = (uint8_t *)malloc(win);
+
+    if (!buf || !out)
+        return false;
+
+    bool hit = false;
+
+    if (base > win) {
+        size_t got = hunt_read_obj(task, base - win, buf, win);
+
+        for (int off = (int)(got - 0x30); off >= 0; off -= 0x10) {
+            float pos[3];
+
+            if (!planet_trs_ok(buf + off, pos))
+                continue;
+            if (!human_root_pos_ok(pos, camP))
+                continue;
+
+            uint64_t a = base - win + (uint64_t)off;
+            bool skipped = false;
+
+            for (int u = 0; u < usedN; u++) {
+                if (used && used[u] == a) {
+                    skipped = true;
+                    break;
+                }
+            }
+
+            if (skipped)
+                continue;
+
+            memcpy(out, pos, sizeof(pos));
+            if (srcOut)
+                *srcOut = a;
+            if (distOut)
+                *distOut = base - a;
+            hit = true;
+            break;
+        }
+    }
+
+    if (!hit) {
+        uint64_t start = base + (uint64_t)(rows > 0 ? rows : 0) * 0x30ULL;
+        size_t got = hunt_read_obj(task, start, buf, win);
+
+        for (int off = 0; off + 0x30 <= (int)got; off += 0x10) {
+            float pos[3];
+
+            if (!planet_trs_ok(buf + off, pos))
+                continue;
+            if (!human_root_pos_ok(pos, camP))
+                continue;
+
+            uint64_t a = start + (uint64_t)off;
+            bool skipped = false;
+
+            for (int u = 0; u < usedN; u++) {
+                if (used && used[u] == a) {
+                    skipped = true;
+                    break;
+                }
+            }
+
+            if (skipped)
+                continue;
+
+            memcpy(out, pos, sizeof(pos));
+            if (srcOut)
+                *srcOut = a;
+            if (distOut)
+                *distOut = a - base;
+            hit = true;
+            break;
+        }
+    }
+
+    free(buf);
+    return hit;
+}
+
+/* Round 39: last resort pairing. Same filters as the near scan, but over every
+   TRS slot the pass collected within 256 KB: near-origin rows, the camera row
+   and roots already claimed by another skeleton are rejected. */
 static bool human_nearest_slot(const trs_slot *slots, int nslots, uint64_t base,
-                               int rows, float *out, uint64_t *srcOut,
+                               int rows, const float *camP,
+                               const uint64_t *used, int usedN,
+                               float *out, uint64_t *srcOut,
                                uint64_t *distOut)
 {
     const uint64_t maxDist = 0x40000ULL;   /* 256 KB */
@@ -1157,6 +1233,7 @@ static bool human_nearest_slot(const trs_slot *slots, int nslots, uint64_t base,
     uint64_t end = base + (uint64_t)(rows > 0 ? rows : 0) * 0x30ULL;
     uint64_t best = 0;
     uint64_t bestd = ~0ULL;
+    const trs_slot *bestSlot = NULL;
 
     for (int i = 0; i < nslots; i++) {
         uint64_t a = slots[i].addr;
@@ -1165,34 +1242,39 @@ static bool human_nearest_slot(const trs_slot *slots, int nslots, uint64_t base,
             continue;   /* the skeleton itself */
 
         uint64_t d = (a > base) ? (a - base) : (base - a);
-        if (d > maxDist)
+        if (d > maxDist || d >= bestd)
             continue;
-        if (d < bestd) {
-            bestd = d;
-            best = a;
+        if (!human_root_pos_ok(&slots[i].px, camP))
+            continue;
+
+        bool skipped = false;
+
+        for (int u = 0; u < usedN; u++) {
+            if (used && used[u] == a) {
+                skipped = true;
+                break;
+            }
         }
+
+        if (skipped)
+            continue;
+
+        best = a;
+        bestd = d;
+        bestSlot = &slots[i];
     }
 
-    if (!best)
+    if (!bestSlot)
         return false;
 
-    for (int i = 0; i < nslots; i++) {
-        if (slots[i].addr != best)
-            continue;
-        if (!human_world_pos_ok(&slots[i].px))
-            return false;
-
-        out[0] = slots[i].px;
-        out[1] = slots[i].py;
-        out[2] = slots[i].pz;
-        if (srcOut)
-            *srcOut = best;
-        if (distOut)
-            *distOut = bestd;
-        return true;
-    }
-
-    return false;
+    out[0] = bestSlot->px;
+    out[1] = bestSlot->py;
+    out[2] = bestSlot->pz;
+    if (srcOut)
+        *srcOut = best;
+    if (distOut)
+        *distOut = bestd;
+    return true;
 }
 
 /* Rotate (0,0,1) by a unit quaternion: Unity's forward axis. */
@@ -3535,6 +3617,9 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
         [self espStageCamera:camP haveP:haveCamP f:camF haveF:haveCamF];
 
     if (arrs) {
+        uint64_t usedRoots[ESP_MAX_BOXES];
+        int nUsedRoots = 0;
+
         for (int i = 0; i < narr; i++) {
             if (gStopRequested.load())
                 break;
@@ -3568,6 +3653,10 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
             const char *roottag = "";
             const char *rootsrc = bind ? "none" : "chain";
             uint64_t rootAddr = bind ? 0 : arrs[i].base;
+            uint64_t src = 0;
+            uint64_t dist = 0;
+            human_owner_dbg od;
+            memset(&od, 0, sizeof(od));
 
             if (bind) {
                 /* Practice-mode bind pose: the chain rows are model space.
@@ -3575,10 +3664,6 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                    owner header, then the wider window, then the nearest
                    in-map transform slot collected by the TRS pass. */
                 float pre[3];
-                uint64_t src = 0;
-                uint64_t dist = 0;
-                human_owner_dbg od;
-                memset(&od, 0, sizeof(od));
 
                 if (human_bind_pre(task, arrs[i].base, pre)) {
                     drawable = YES;
@@ -3595,13 +3680,19 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                                 od.ncand, od.tested,
                                 (unsigned long long)arrs[i].base];
 
-                    if (human_wide_pre(task, arrs[i].base, pre, &src)) {
+                    if (human_near_trs(task, arrs[i].base, arrs[i].count,
+                                       haveCamP ? camP : NULL,
+                                       usedRoots, nUsedRoots,
+                                       pre, &src, &dist)) {
                         drawable = YES;
                         roottag = " root=wide";
                         rootsrc = "wide";
                         rootAddr = src;
                     } else if (human_nearest_slot(slots, nslots, arrs[i].base,
-                                                  arrs[i].count, pre, &src, &dist)) {
+                                                  arrs[i].count,
+                                                  haveCamP ? camP : NULL,
+                                                  usedRoots, nUsedRoots,
+                                                  pre, &src, &dist)) {
                         drawable = YES;
                         roottag = " root=slot";
                         rootsrc = "slot";
@@ -3616,9 +3707,8 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                     rootP[0] = pre[0];
                     rootP[1] = pre[1];
                     rootP[2] = pre[2];
-                    if (rootsrc[0] == 's' && rootsrc[1] == 'l')
-                        [self vlogLine:@"human: slot src=0x%llx dist=0x%llx P=(%.3f,%.3f,%.3f)",
-                                    src, dist, pre[0], pre[1], pre[2]];
+                    if (rootAddr && nUsedRoots < ESP_MAX_BOXES)
+                        usedRoots[nUsedRoots++] = rootAddr;
                 }
             } else if (fabsf(rootP[0]) < 3000.0f &&
                        fabsf(rootP[2]) < 3000.0f &&
@@ -3630,8 +3720,9 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
 
             humanHits++;
 
-            [self vlogLine:@"human: root=0x%llx bind=%d src=%s slots=%d P=(%.3f,%.3f,%.3f)",
+            [self vlogLine:@"human: root=0x%llx bind=%d src=%s slots=%d dist=0x%llx P=(%.3f,%.3f,%.3f)",
                         rootAddr, bind ? 1 : 0, rootsrc, arrs[i].count,
+                        (unsigned long long)dist,
                         rootP[0], rootP[1], rootP[2]];
 
             if (drawable && _espMode && _espStageN < ESP_MAX_BOXES) {
