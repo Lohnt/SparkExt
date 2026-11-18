@@ -1041,9 +1041,19 @@ static bool human_probe_ptr(mach_port_t task, uint64_t c, float *out,
 
 /* Pointers in the 0x100-byte owner header before the chain, plus one level of
    their children: the actor root Transform is normally the first component. */
+typedef struct {
+    uint64_t hdr;
+    uint64_t p[4];
+    int ncand;
+    int tested;
+} human_owner_dbg;
+
 static bool human_owner_root(mach_port_t task, uint64_t base, float *out,
-                             uint64_t *srcOut)
+                             uint64_t *srcOut, human_owner_dbg *dbg)
 {
+    if (dbg)
+        memset(dbg, 0, sizeof(*dbg));
+
     if (!out || base <= PLANET_HUMAN_OWNER)
         return false;
 
@@ -1053,6 +1063,12 @@ static bool human_owner_root(mach_port_t task, uint64_t base, float *out,
     size_t hh = hunt_read_obj(task, hb, hw, sizeof(hw));
     if (hh < 8)
         return false;
+
+    if (dbg) {
+        dbg->hdr = hb;
+        for (int i = 0; i < 4 && (size_t)(i + 1) * 8 <= hh; i++)
+            memcpy(&dbg->p[i], hw + (size_t)i * 8, sizeof(uint64_t));
+    }
 
     uint64_t cand[40];
     int nc = 0;
@@ -1078,7 +1094,12 @@ static bool human_owner_root(mach_port_t task, uint64_t base, float *out,
         }
     }
 
+    if (dbg)
+        dbg->ncand = nc;
+
     for (int i = 0; i < nc; i++) {
+        if (dbg)
+            dbg->tested = i + 1;
         if (human_probe_ptr(task, cand[i], out, srcOut))
             return true;
     }
@@ -1092,12 +1113,12 @@ static bool human_owner_root(mach_port_t task, uint64_t base, float *out,
 static bool human_wide_pre(mach_port_t task, uint64_t base, float *out,
                            uint64_t *srcOut)
 {
-    const uint64_t win = 0x1000;
+    const uint64_t win = 0x4000;
 
     if (!out || base <= win)
         return false;
 
-    uint8_t buf[0x1000];
+    uint8_t buf[0x4000];
     memset(buf, 0, sizeof(buf));
     size_t got = hunt_read_obj(task, base - win, buf, sizeof(buf));
     if (got < 0x30)
@@ -1114,6 +1135,60 @@ static bool human_wide_pre(mach_port_t task, uint64_t base, float *out,
         memcpy(out, pos, sizeof(pos));
         if (srcOut)
             *srcOut = base - win + (uint64_t)off;
+        return true;
+    }
+
+    return false;
+}
+
+/* Round 38: last resort pairing. A bind chain carries no world position, but
+   the TRS pass already collected every in-map transform near it; the actor's
+   root is the closest slot outside the skeleton. Distance is logged so a wrong
+   pairing is visible. */
+static bool human_nearest_slot(const trs_slot *slots, int nslots, uint64_t base,
+                               int rows, float *out, uint64_t *srcOut,
+                               uint64_t *distOut)
+{
+    const uint64_t maxDist = 0x40000ULL;   /* 256 KB */
+
+    if (!slots || nslots <= 0 || !out)
+        return false;
+
+    uint64_t end = base + (uint64_t)(rows > 0 ? rows : 0) * 0x30ULL;
+    uint64_t best = 0;
+    uint64_t bestd = ~0ULL;
+
+    for (int i = 0; i < nslots; i++) {
+        uint64_t a = slots[i].addr;
+
+        if (a >= base && a < end)
+            continue;   /* the skeleton itself */
+
+        uint64_t d = (a > base) ? (a - base) : (base - a);
+        if (d > maxDist)
+            continue;
+        if (d < bestd) {
+            bestd = d;
+            best = a;
+        }
+    }
+
+    if (!best)
+        return false;
+
+    for (int i = 0; i < nslots; i++) {
+        if (slots[i].addr != best)
+            continue;
+        if (!human_world_pos_ok(&slots[i].px))
+            return false;
+
+        out[0] = slots[i].px;
+        out[1] = slots[i].py;
+        out[2] = slots[i].pz;
+        if (srcOut)
+            *srcOut = best;
+        if (distOut)
+            *distOut = bestd;
         return true;
     }
 
@@ -3419,6 +3494,19 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
        here, so scan activity cannot blank the boxes already on screen. */
     _camKind = haveCamP ? 1 : 0;
 
+    if (haveCamP) {
+        const char *tsrc = haveCamF ? "T" : "cache";
+
+        [self vlogLine:@"cam: inst=0x0 kind=2 src=%s P=(%.3f,%.3f,%.3f) Q=(0.000,0.000,0.000,1.000) F=(%.3f,%.3f,%.3f)",
+                    tsrc, camP[0], camP[1], camP[2],
+                    camF[0], camF[1], camF[2]];
+        [self vlogLine:@"cam: main src=%s P=(%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f)",
+                    tsrc, camP[0], camP[1], camP[2],
+                    camF[0], camF[1], camF[2]];
+    } else {
+        [self vlogLine:@"cam: main src=none (no view state, no metadata camera)"];
+    }
+
     /* Round 34: the view-state camera (T+0x120) is absent in practice mode, so
        fall back to UnityEngine.Camera::main through the metadata. */
     float camClassP[3];
@@ -3484,33 +3572,53 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
             if (bind) {
                 /* Practice-mode bind pose: the chain rows are model space.
                    Companion row first, then the owning object probed from the
-                   owner header, then the wider 0x1000 window. */
+                   owner header, then the wider window, then the nearest
+                   in-map transform slot collected by the TRS pass. */
                 float pre[3];
                 uint64_t src = 0;
+                uint64_t dist = 0;
+                human_owner_dbg od;
+                memset(&od, 0, sizeof(od));
 
                 if (human_bind_pre(task, arrs[i].base, pre)) {
                     drawable = YES;
                     roottag = " root=pre";
                     rootsrc = "pre";
-                } else if (human_owner_root(task, arrs[i].base, pre, &src)) {
+                } else if (human_owner_root(task, arrs[i].base, pre, &src, &od)) {
                     drawable = YES;
                     roottag = " root=owner";
                     rootsrc = "owner";
                     rootAddr = src;
-                } else if (human_wide_pre(task, arrs[i].base, pre, &src)) {
-                    drawable = YES;
-                    roottag = " root=wide";
-                    rootsrc = "wide";
-                    rootAddr = src;
                 } else {
-                    humanBind++;
-                    roottag = " root=BIND";
+                    [self vlogLine:@"human: owner hdr=0x%llx p=0x%llx,0x%llx,0x%llx,0x%llx cands=%d tested=%d base=0x%llx",
+                                od.hdr, od.p[0], od.p[1], od.p[2], od.p[3],
+                                od.ncand, od.tested,
+                                (unsigned long long)arrs[i].base];
+
+                    if (human_wide_pre(task, arrs[i].base, pre, &src)) {
+                        drawable = YES;
+                        roottag = " root=wide";
+                        rootsrc = "wide";
+                        rootAddr = src;
+                    } else if (human_nearest_slot(slots, nslots, arrs[i].base,
+                                                  arrs[i].count, pre, &src, &dist)) {
+                        drawable = YES;
+                        roottag = " root=slot";
+                        rootsrc = "slot";
+                        rootAddr = src;
+                    } else {
+                        humanBind++;
+                        roottag = " root=BIND";
+                    }
                 }
 
                 if (drawable) {
                     rootP[0] = pre[0];
                     rootP[1] = pre[1];
                     rootP[2] = pre[2];
+                    if (rootsrc[0] == 's' && rootsrc[1] == 'l')
+                        [self vlogLine:@"human: slot src=0x%llx dist=0x%llx P=(%.3f,%.3f,%.3f)",
+                                    src, dist, pre[0], pre[1], pre[2]];
                 }
             } else if (fabsf(rootP[0]) < 3000.0f &&
                        fabsf(rootP[2]) < 3000.0f &&
@@ -3912,6 +4020,84 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
         if (isfinite(selfF[0]) && isfinite(selfF[1]) && isfinite(selfF[2]) &&
             fl >= ESP_CAM_FWD_MIN && fl <= ESP_CAM_FWD_MAX)
             haveSelfF = true;
+    }
+
+    /* Round 38: the view-state camera is the primary source, but _localV can be
+       stale or unset, which silently turned ESP off. Scan the cached actor
+       slots for any V whose view state yields a plausible position and a unit
+       forward, and take the one nearest the previous camera. */
+    int viewCands = 0;
+
+    if (!haveSelfP || !haveSelfF) {
+        uint64_t bestT = 0;
+        uint64_t bestV = 0;
+        float bestP[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float bestF[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float bestScore = 1.0e9f;
+
+        for (NSNumber *key in _actorSlots) {
+            if (viewCands >= 8000)
+                break;
+            viewCands++;
+
+            uint64_t v = key.unsignedLongLongValue;
+            uint64_t t = rd64(task, v + VIEW_OFF_FIELD);
+            if (t < HUNT_PTR_MIN)
+                continue;
+
+            float p[4], f[4];
+            if (!mr_read(task, t + 0x120, p, sizeof(p)))
+                continue;
+            if (!mr_read(task, t + 0x130, f, sizeof(f)))
+                continue;
+
+            float fl = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+            if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2]))
+                continue;
+            if (fabsf(p[0]) > 3000.0f || fabsf(p[2]) > 3000.0f ||
+                fabsf(p[1]) > 500.0f)
+                continue;
+            if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f)
+                continue;
+            if (!isfinite(fl) || fl < ESP_CAM_FWD_MIN || fl > ESP_CAM_FWD_MAX)
+                continue;
+
+            float score = 0.0f;
+            if (_prevSelfValid) {
+                float dx = p[0] - _prevSelfP[0];
+                float dy = p[1] - _prevSelfP[1];
+                float dz = p[2] - _prevSelfP[2];
+                score = sqrtf(dx * dx + dy * dy + dz * dz);
+            }
+
+            if (score < bestScore) {
+                bestScore = score;
+                bestT = t;
+                bestV = v;
+                memcpy(bestP, p, sizeof(bestP));
+                memcpy(bestF, f, sizeof(bestF));
+            }
+        }
+
+        if (bestT) {
+            selfT = bestT;
+            memcpy(selfP, bestP, sizeof(selfP));
+            memcpy(selfF, bestF, sizeof(selfF));
+            haveSelfP = YES;
+            haveSelfF = YES;
+
+            [self vlogLine:@"cam: view state T=0x%llx V=0x%llx src=scan cands=%d P=(%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f)",
+                        (unsigned long long)selfT, (unsigned long long)bestV,
+                        viewCands, selfP[0], selfP[1], selfP[2],
+                        selfF[0], selfF[1], selfF[2]];
+        } else {
+            [self vlogLine:@"cam: view state missing localV=0x%llx actors=%d",
+                        (unsigned long long)_localV, viewCands];
+        }
+    } else {
+        [self vlogLine:@"cam: view state T=0x%llx src=T P=(%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f)",
+                    (unsigned long long)selfT, selfP[0], selfP[1], selfP[2],
+                    selfF[0], selfF[1], selfF[2]];
     }
 
     [self vlogLine:@"planetary: self V=0x%llx T=0x%llx P=(%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f) %s%s",
