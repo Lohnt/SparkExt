@@ -21,6 +21,7 @@ typedef struct {
     CFAbsoluteTime stamp;          /* completion time, drives the age text */
     int fovDeg;                    /* horizontal FOV used for this snapshot */
     int camSrc;                    /* 0 none, 1 fresh forward, 2 cached forward */
+    int mirror;                    /* 1: projected x mirrored about centre */
     int rootN;                     /* humanoid roots copied from staging */
     int bindN;                     /* skeletons found but not drawable */
     BOOL haveCam;
@@ -72,7 +73,7 @@ typedef struct {
 static bool esp_project_point(const float *p, const float *cam,
                               const float *right, const float *upv,
                               const float *fwd, float sx,
-                              float cx, float cy, CGPoint *out)
+                              float cx, float cy, BOOL mirror, CGPoint *out)
 {
     float vx = p[0] - cam[0];
     float vy = p[1] - cam[1];
@@ -87,6 +88,12 @@ static bool esp_project_point(const float *p, const float *cam,
 
     out->x = cx + (xv / zv) * sx;
     out->y = cy - (yv / zv) * sx;
+
+    /* Round 32: horizontal mirror about the overlay centre, applied after the
+       projection so it is exactly x = W - x. */
+    if (mirror)
+        out->x = (cx * 2.0f) - out->x;
+
     return isfinite(out->x) && isfinite(out->y);
 }
 
@@ -114,6 +121,8 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
     float H = (float)size.height;
     if (W < 1.0f || H < 1.0f)
         return 0;
+
+    BOOL mirror = s->mirror ? YES : NO;
 
     float tanHalf = tanf((float)s->fovDeg * 0.5f * (float)M_PI / 180.0f);
     if (!(tanHalf > 1e-4f))
@@ -154,7 +163,7 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
         CGPoint bot;
         CGPoint top;
 
-        if (!esp_project_point(root, cam, right, upv, fwd, sx, cx, cy, &bot)) {
+        if (!esp_project_point(root, cam, right, upv, fwd, sx, cx, cy, mirror, &bot)) {
             behind++;
             if (skips && skipped + behind <= skipCap) {
                 int k = skipped + behind - 1;
@@ -169,7 +178,7 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
             continue;
         }
 
-        if (!esp_project_point(crown, cam, right, upv, fwd, sx, cx, cy, &top)) {
+        if (!esp_project_point(crown, cam, right, upv, fwd, sx, cx, cy, mirror, &top)) {
             skipped++;
             if (skips && skipped + behind <= skipCap) {
                 int k = skipped + behind - 1;
@@ -311,6 +320,48 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
     [self espRedraw];
 }
 
+/* Round 32: MIRROR button. Persisted and applied as a new immutable snapshot
+   derived from the current one, so the draw path stays snapshot-only. */
+- (void)espUpdateMirrorTitle
+{
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self espUpdateMirrorTitle]; });
+        return;
+    }
+
+    [_mirrorButton setTitle:(_espMirror ? @"MIRROR: ON" : @"MIRROR: OFF")
+                   forState:UIControlStateNormal];
+    [_mirrorButton setTitleColor:(_espMirror ? [UIColor yellowColor] : [UIColor cyanColor])
+                        forState:UIControlStateNormal];
+}
+
+- (void)mirrorToggled:(UIButton *)sender
+{
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self mirrorToggled:sender]; });
+        return;
+    }
+
+    _espMirror = !_espMirror;
+    [[NSUserDefaults standardUserDefaults] setBool:_espMirror forKey:@"diag.esp.mirror"];
+
+    diag_log("diag: esp mirror toggled");
+
+    const esp_snapshot *cur = esp_current();
+    if (cur) {
+        esp_snapshot *next = (esp_snapshot *)malloc(sizeof(*next));
+        if (next) {
+            memcpy(next, cur, sizeof(*next));
+            next->mirror = _espMirror ? 1 : 0;
+            esp_publish(next);
+        }
+    }
+
+    [self espUpdateMirrorTitle];
+    [self logLine:@"ESP mirror=%d (redraw from cached scan)", _espMirror ? 1 : 0];
+    [self espRedraw];
+}
+
 - (void)espTick
 {
     if (!_espMode) {
@@ -385,6 +436,7 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
     s->stamp = CFAbsoluteTimeGetCurrent();
     s->fovDeg = [self espFovDegrees];
     s->camSrc = _espStageCamSrc;
+    s->mirror = _espMirror ? 1 : 0;
     s->haveCam = _espStageHaveCam ? YES : NO;
     s->rootN = _espStageN;
     s->bindN = _espStageBind;
@@ -545,10 +597,11 @@ static int esp_build_boxes(const esp_snapshot *s, CGSize size,
 
     for (int i = 0; i < drawn; i++) {
         esp_box *b = &boxes[i];
-        [self vlogLine:@"ESP BOX %d root=(%.3f,%.3f,%.3f) screen=(%.1f,%.1f) w=%.1f h=%.1f",
+        [self vlogLine:@"ESP BOX %d root=(%.3f,%.3f,%.3f) screen=(%.1f,%.1f) w=%.1f h=%.1f mir=%d",
                     i, b->root[0], b->root[1], b->root[2],
                     (double)b->feet.x, (double)b->feet.y,
-                    (double)b->rect.size.width, (double)b->rect.size.height];
+                    (double)b->rect.size.width, (double)b->rect.size.height,
+                    s ? s->mirror : 0];
     }
 
     /* Offline check for a zero-box scan: which test rejected which root. */

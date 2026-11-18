@@ -60,6 +60,7 @@ static bool diag_sleep_checked(double seconds)
        an immutable snapshot. */
     _espMode = NO;
     _espFovIdx = ESP_FOV_DEFAULT;
+    _espMirror = [[NSUserDefaults standardUserDefaults] boolForKey:@"diag.esp.mirror"];
     _espStageN = 0;
     _espStageBind = 0;
     _espStageHaveCam = NO;
@@ -147,10 +148,22 @@ static bool diag_sleep_checked(double seconds)
          forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:_fovControl];
 
+    /* Round 32: horizontal mirror. The projection right vector is known to be
+       handed the wrong way on some devices, so this flips the projected x about
+       the overlay centre. Persisted like the rest of the ESP state. */
+    _mirrorButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_mirrorButton setTitleColor:[UIColor cyanColor] forState:UIControlStateNormal];
+    _mirrorButton.frame = CGRectMake(self.view.bounds.size.width - 470.0, 52.0, 95.0, 30.0);
+    _mirrorButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+    [_mirrorButton addTarget:self action:@selector(mirrorToggled:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_mirrorButton];
+    [self espUpdateMirrorTitle];
+
     [self.view bringSubviewToFront:_rerunButton];
     [self.view bringSubviewToFront:_espButton];
     [self.view bringSubviewToFront:_rescanButton];
     [self.view bringSubviewToFront:_fovControl];
+    [self.view bringSubviewToFront:_mirrorButton];
     [self.view bringSubviewToFront:_stopButton];
     [self.view bringSubviewToFront:_exitButton];
 

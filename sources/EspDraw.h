@@ -15,6 +15,10 @@
    fovX and redraws. Never reads the game. */
 - (void)fovChanged:(UISegmentedControl *)sender;
 
+/* Round 32: horizontal mirror toggle (persisted) and its button title. */
+- (void)mirrorToggled:(UIButton *)sender;
+- (void)espUpdateMirrorTitle;
+
 /* 1 s age ticker and rotation redraw. */
 - (void)espTick;
 - (void)espRotated:(NSNotification *)note;

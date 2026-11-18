@@ -25,7 +25,7 @@ typedef struct {
 #define ESP_FOV_COUNT       8
 #define ESP_FOV_DEFAULT     4        /* index of 100 degrees */
 #define ESP_BODY_HEIGHT     1.8f     /* feet -> crown, metres */
-#define ESP_BOX_WIDTH_RATIO 0.25f    /* box width = height / 4 */
+#define ESP_BOX_WIDTH_RATIO (1.0f / 3.0f) /* box width = height / 3 */
 #define ESP_MIN_BOX_PX      2.0f
 #define ESP_NEAR_PLANE      0.1f
 #define ESP_CAM_FWD_MIN     0.5f
@@ -83,6 +83,8 @@ typedef struct {
     UISegmentedControl *_fovControl;
     BOOL _espMode;
     int _espFovIdx;
+    UIButton *_mirrorButton;      /* horizontal mirror toggle, persisted */
+    BOOL _espMirror;
     NSTimer *_espTimer;
 
     /* Worker-owned staging buffer: filled by the TRS pass, consumed once by
