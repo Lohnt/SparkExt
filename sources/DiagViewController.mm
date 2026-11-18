@@ -38,6 +38,18 @@
 #define TOP_CANDIDATES     12
 #define SCREEN_TOP_LINES   150
 
+/* --- VIEW phase (local player view state) ------------------------------- */
+#define VIEW_OFF_FIELD      0xd0     /* td6362: actor -> view state object */
+#define VIEW_CFG_FIELD      0x18     /* actor -> config object */
+#define VIEW_SCAN_SIZE      0x300
+#define VIEW_WALK_DEPTH     2
+#define VIEW_WALK_BUDGET    64       /* objects per walk, root included */
+#define VIEW_REGION_MAX     (2 + 2 * VIEW_WALK_BUDGET)
+#define VIEW_PATH_LEN       220
+#define VIEW_SCREEN_LINES   60
+#define VIEW_SPINE_STRIDE   0x58ULL
+#define VIEW_SPINE_BYTES    0x58
+
 /* --- il2cpp class metadata ---------------------------------------------- */
 #define ACTOR_NAME_EXPECT  "O7D1D7DB39"
 #define TD_UNITY_TRANSFORM 13036ULL
@@ -499,6 +511,184 @@ static int hunt_walk(mach_port_t task, uint64_t v, uint64_t uf_base, uint64_t me
     return n;
 }
 
+/* ------------------------------------------------------------ view state */
+
+/* Slot tags are bit flags so one slot can belong to more than one shape at
+   once (a matrix column can hold a position triple, for example). */
+enum {
+    VIEW_TAG_POS_START  = 1 << 0,
+    VIEW_TAG_POS_MEMBER = 1 << 1,
+    VIEW_TAG_DIR_START  = 1 << 2,
+    VIEW_TAG_DIR4_START = 1 << 3,
+    VIEW_TAG_DIR_MEMBER = 1 << 4,
+    VIEW_TAG_MAT_START  = 1 << 5,
+    VIEW_TAG_MAT_MEMBER = 1 << 6
+};
+
+/* One chunk of VIEW-phase memory: the view state object (T), the config object
+   (C), or a pointer target reached from either. */
+typedef struct {
+    uint64_t addr;
+    uint32_t len;
+    char     path[VIEW_PATH_LEN];
+} view_region;
+
+typedef struct {
+    int slots;
+    int pos;
+    int dir;
+    int mat;
+    int changed;
+    int added;
+} view_stats;
+
+/* The run #22 position filter, reused verbatim: finite vec3 with |x|,|z| >= 1,
+   y either exactly 0 or at least 1, inside the map box, not constant. */
+static bool view_pos_ok(const float *f)
+{
+    if (!isfinite(f[0]) || !isfinite(f[1]) || !isfinite(f[2]))
+        return false;
+    if (fabsf(f[0]) < 1.0f || fabsf(f[2]) < 1.0f)
+        return false;
+    if (fabsf(f[1]) < 1.0f && f[1] != 0.0f)
+        return false;
+    if (fabsf(f[0]) > HUNT_POS_XZ_LIMIT || fabsf(f[2]) > HUNT_POS_XZ_LIMIT)
+        return false;
+    if (fabsf(f[1]) > HUNT_POS_Y_LIMIT)
+        return false;
+    if (f[0] == f[1] && f[1] == f[2])
+        return false;
+    return true;
+}
+
+/* Normalised direction over three floats; the 4th one is often exactly 0.0. */
+static bool view_dir_ok(const float *f, float *lenOut)
+{
+    if (!isfinite(f[0]) || !isfinite(f[1]) || !isfinite(f[2]))
+        return false;
+
+    float len = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+    if (lenOut)
+        *lenOut = len;
+    return len >= 0.98f && len <= 1.02f;
+}
+
+/* 4x4 float block whose elements 12..15 are (0,0,0,1) with a non-zero rotation
+   part; plain zero blocks are rejected. */
+static bool view_mat_ok(const float *m)
+{
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(m[i]))
+            return false;
+    }
+
+    if (!(m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f && m[15] == 1.0f))
+        return false;
+
+    for (int i = 0; i < 12; i++) {
+        if (m[i] != 0.0f)
+            return true;
+    }
+    return false;
+}
+
+static const char *view_tag_name(uint8_t tag)
+{
+    if (tag & VIEW_TAG_POS_START)
+        return "POS";
+    if (tag & VIEW_TAG_DIR4_START)
+        return "DIR4";
+    if (tag & VIEW_TAG_DIR_START)
+        return "DIR";
+    if (tag & VIEW_TAG_MAT_START)
+        return "MAT";
+    if (tag & VIEW_TAG_POS_MEMBER)
+        return "POS*";
+    if (tag & VIEW_TAG_DIR_MEMBER)
+        return "DIR*";
+    if (tag & VIEW_TAG_MAT_MEMBER)
+        return "MAT*";
+    return "raw";
+}
+
+/* Depth-2 pointer walk for the VIEW phase. Appends the root and everything its
+   pointers reach (at most VIEW_WALK_BUDGET objects including the root) to regs,
+   skipping +0x00 and any target inside the il2cpp metadata blob. Native Unity
+   objects and il2cpp objects are both accepted and both scanned over 0x300. */
+static int view_walk(mach_port_t task, uint64_t uf_base, uint64_t meta,
+                     view_region *regs, int start, int maxn,
+                     uint64_t root, const char *rootPath)
+{
+    if (!root || start >= maxn)
+        return start;
+
+    for (int k = 0; k < start; k++) {
+        if (regs[k].addr == root)
+            return start;
+    }
+
+    regs[start].addr = root;
+    regs[start].len = VIEW_SCAN_SIZE;
+    snprintf(regs[start].path, sizeof(regs[start].path), "%s", rootPath);
+
+    int n = start + 1;
+    int levelBegin = start;
+    int levelEnd = n;
+
+    for (int depth = 1; depth <= VIEW_WALK_DEPTH && n < maxn; depth++) {
+        int nextBegin = n;
+
+        for (int i = levelBegin; i < levelEnd && n < maxn; i++) {
+            if (gStopRequested.load())
+                return n;
+
+            uint8_t buf[VIEW_SCAN_SIZE];
+            size_t have = hunt_read_obj(task, regs[i].addr, buf, VIEW_SCAN_SIZE);
+            if (have == 0)
+                continue;
+
+            for (size_t off = 8; off + 8 <= have && n < maxn; off += 8) {
+                uint64_t p = 0;
+                memcpy(&p, buf + off, sizeof(p));
+
+                if (p < HUNT_PTR_MIN)
+                    continue;
+                if (meta_range_ok(p, meta))
+                    continue;
+
+                bool dup = false;
+                for (int k = 0; k < n; k++) {
+                    if (regs[k].addr == p) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup)
+                    continue;
+
+                uint64_t scanSize = 0;
+                int isNative = 0;
+                if (!hunt_classify(task, p, uf_base, meta, &scanSize, &isNative))
+                    continue;
+
+                regs[n].addr = p;
+                regs[n].len = VIEW_SCAN_SIZE;
+                snprintf(regs[n].path, sizeof(regs[n].path), "%s+0x%02zx->0x%llx",
+                         regs[i].path, off, (unsigned long long)p);
+                n++;
+            }
+        }
+
+        if (n == nextBegin)
+            break;
+
+        levelBegin = nextBegin;
+        levelEnd = n;
+    }
+
+    return n;
+}
+
 /* Scans one object's bytes for the three field signatures. */
 static int hunt_object(const uint8_t *buf, size_t size, int objidx,
                        hunt_hit *out, int maxout)
@@ -542,17 +732,7 @@ static int hunt_object(const uint8_t *buf, size_t size, int objidx,
         float f[3];
         memcpy(f, buf + off, sizeof(f));
 
-        if (!isfinite(f[0]) || !isfinite(f[1]) || !isfinite(f[2]))
-            continue;
-        if (fabsf(f[0]) < 1.0f || fabsf(f[2]) < 1.0f)
-            continue;
-        if (fabsf(f[1]) < 1.0f && f[1] != 0.0f)
-            continue;
-        if (fabsf(f[0]) > HUNT_POS_XZ_LIMIT || fabsf(f[2]) > HUNT_POS_XZ_LIMIT)
-            continue;
-        if (fabsf(f[1]) > HUNT_POS_Y_LIMIT)
-            continue;
-        if (f[0] == f[1] && f[1] == f[2])
+        if (!view_pos_ok(f))
             continue;
 
         /* Sliding-window suppression: the same triple shifted by 4 bytes. */
@@ -738,6 +918,11 @@ stopped:
     /* Previous scan's hit values, keyed by "path|kind|offset". Lives across
        scans so RESCAN can label hits SAME or CHANGED. */
     NSMutableDictionary *_hitCache;
+
+    /* VIEW phase: raw 32-bit slot contents from the previous scan, keyed by the
+       absolute slot address, and the V picked as the local player's actor. */
+    NSMutableDictionary *_viewSlots;
+    uint64_t _localV;
 }
 
 - (void)appendLog:(NSString *)line;
@@ -754,6 +939,23 @@ stopped:
 - (void)startRun;
 - (void)attachLoop;
 - (void)runDiagnostic;
+- (void)runViewPhaseTask:(mach_port_t)task
+                     ctx:(const il2cpp_ctx *)ctx
+              candidates:(const cand_t *)cands
+                   count:(int)count
+                 candChg:(const int *)candChg;
+- (void)viewDumpSpineTask:(mach_port_t)task
+                     meta:(uint64_t)meta
+               candidates:(const cand_t *)cands
+                    count:(int)count;
+- (void)viewScanRegion:(const view_region *)reg
+                  task:(mach_port_t)task
+                  prev:(NSDictionary *)prev
+                  next:(NSMutableDictionary *)next
+                 probe:(uint64_t)probe
+                 stats:(view_stats *)vs
+            screenLeft:(int *)left;
+- (void)viewEmit:(NSString *)line screenLeft:(int *)left;
 
 @end
 
@@ -768,6 +970,8 @@ stopped:
     _pid = 0;
     _workQueue = dispatch_queue_create("dev.cops.diag.work", DISPATCH_QUEUE_SERIAL);
     _hitCache = [NSMutableDictionary dictionary];
+    _viewSlots = [NSMutableDictionary dictionary];
+    _localV = 0;
 
     self.view.backgroundColor = [UIColor blackColor];
 
@@ -1436,11 +1640,399 @@ stopped:
     [self vlogLine:@"diff: %d changed of %d hits across %d candidates",
                 totalChg, totalQuat + totalPos + totalInt, count];
 
+    if (!gStopRequested.load()) {
+        [self runViewPhaseTask:task ctx:&ctx candidates:candidates count:count
+                       candChg:candChg];
+    }
+
     free(objs);
     free(hits);
     free(buf);
 
     diag_log("diag: scan complete");
+}
+
+/* ---------------- VIEW phase ------------------------------------------ */
+
+/* Focused look at the local player's view state. Run #22 established that the
+   live position/direction hang off T = read64(V+0xd0) (field td6362), not off
+   the actor itself, and that only the local player's graph moves. So T and the
+   config object C are scanned together with everything their pointers reach,
+   and every 4-byte float slot is diffed against the previous scan. */
+- (void)runViewPhaseTask:(mach_port_t)task
+                     ctx:(const il2cpp_ctx *)ctx
+              candidates:(const cand_t *)cands
+                   count:(int)count
+                 candChg:(const int *)candChg
+{
+    [self logLine:@"--- VIEW phase ---"];
+
+    /* Item 5: identify the first node of the +0x58-stride actor run. */
+    [self viewDumpSpineTask:task meta:ctx->metadata_base candidates:cands
+                      count:count];
+
+    /* LOCAL = the config-linked candidate that changed most in the hunt, with
+       the previous pick winning ties so RESCAN stays on the same actor. */
+    int localIdx = -1;
+
+    for (int i = 0; i < count; i++) {
+        if (!cands[i].config_link)
+            continue;
+        if (localIdx < 0) {
+            localIdx = i;
+        } else if (candChg[i] > candChg[localIdx]) {
+            localIdx = i;
+        } else if (candChg[i] == candChg[localIdx] && _localV &&
+                   cands[i].v == _localV) {
+            localIdx = i;
+        }
+    }
+
+    view_stats vs;
+    memset(&vs, 0, sizeof(vs));
+
+    if (localIdx < 0) {
+        [self logLine:@"view: no config-linked candidate"];
+        [self logLine:@"view: %d slots / %d pos / %d dir / %d mat (%d changed)",
+                   vs.slots, vs.pos, vs.dir, vs.mat, vs.changed];
+        return;
+    }
+
+    uint64_t vLocal = cands[localIdx].v;
+    uint64_t tObj = rd64(task, vLocal + VIEW_OFF_FIELD);
+    uint64_t cfgObj = rd64(task, vLocal + VIEW_CFG_FIELD);
+    _localV = vLocal;
+
+    [self vlogLine:@"view LOCAL cand[%d] V=0x%llx chg=%d T=0x%llx C=0x%llx",
+                localIdx, (unsigned long long)vLocal, candChg[localIdx],
+                (unsigned long long)tObj, (unsigned long long)cfgObj];
+
+    view_region *regs = (view_region *)calloc(VIEW_REGION_MAX, sizeof(view_region));
+    if (!regs) {
+        [self logLine:@"view: out of memory"];
+        return;
+    }
+
+    int nregs = 0;
+    int tRegs = 0;
+
+    if (tObj) {
+        nregs = view_walk(task, ctx->uf_base, ctx->metadata_base, regs, 0,
+                          VIEW_REGION_MAX, tObj, "T");
+        tRegs = nregs;
+    } else {
+        [self logLine:@"view: T = 0 (V+0x%02x unreadable)", VIEW_OFF_FIELD];
+    }
+
+    if (cfgObj) {
+        nregs = view_walk(task, ctx->uf_base, ctx->metadata_base, regs, nregs,
+                          VIEW_REGION_MAX, cfgObj, "C");
+    }
+
+    [self vlogLine:@"view regions = %d (T %d, C %d)", nregs, tRegs, nregs - tRegs];
+
+    NSDictionary *prev = _viewSlots ?: [NSDictionary dictionary];
+    NSMutableDictionary *next = [NSMutableDictionary dictionaryWithCapacity:32768];
+
+    int left = VIEW_SCREEN_LINES;
+    bool stopped = false;
+
+    for (int i = 0; i < nregs; i++) {
+        if (gStopRequested.load()) {
+            stopped = true;
+            break;
+        }
+        [self viewScanRegion:&regs[i] task:task prev:prev next:next
+                        probe:tObj stats:&vs screenLeft:&left];
+    }
+
+    /* On an aborted pass keep the old snapshot; a partial one would make every
+       untouched slot look NEW next time. */
+    if (!stopped)
+        _viewSlots = next;
+
+    if (left <= 0)
+        [self logLine:@"  ... view block truncated; full hits in diag_scan.log"];
+
+    [self logLine:@"view: %d slots / %d pos / %d dir / %d mat (%d changed)",
+               vs.slots, vs.pos, vs.dir, vs.mat, vs.changed];
+    [self vlogLine:@"view new slots = %d", vs.added];
+
+    if (stopped)
+        [self logLine:@"scan stopped"];
+
+    free(regs);
+}
+
+/* Item 5: find the first node of the candidate run spaced 0x58 apart and dump
+   its first 0x58 bytes as hex + float rows, file only. */
+- (void)viewDumpSpineTask:(mach_port_t)task
+                     meta:(uint64_t)meta
+               candidates:(const cand_t *)cands
+                    count:(int)count
+{
+    uint64_t head = 0;
+
+    for (int i = 0; i < count && !head; i++) {
+        uint64_t v = cands[i].v;
+        bool hasFwd = false;
+        bool hasBack = false;
+
+        for (int j = 0; j < count; j++) {
+            if (j == i)
+                continue;
+            if (cands[j].v == v + VIEW_SPINE_STRIDE)
+                hasFwd = true;
+            else if (cands[j].v == v - VIEW_SPINE_STRIDE)
+                hasBack = true;
+        }
+
+        if (hasFwd && !hasBack)
+            head = v;
+    }
+
+    if (!head) {
+        [self vlogLine:@"VIEW SPINE: no candidate has a +0x%llx neighbour",
+                    VIEW_SPINE_STRIDE];
+        return;
+    }
+
+    int runLen = 1;
+    for (int step = 1; step < 512; step++) {
+        uint64_t want = head + (uint64_t)step * VIEW_SPINE_STRIDE;
+        bool found = false;
+
+        for (int j = 0; j < count; j++) {
+            if (cands[j].v == want) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            break;
+        runLen = step + 1;
+    }
+
+    uint8_t raw[VIEW_SPINE_BYTES];
+    memset(raw, 0, sizeof(raw));
+    size_t have = hunt_read_obj(task, head, raw, sizeof(raw));
+
+    /* The first qword is the class pointer on an il2cpp instance; resolving it
+       names the array element so the dump can be identified directly. */
+    uint64_t cls = 0;
+    memcpy(&cls, raw, sizeof(cls));
+
+    char clsName[40];
+    clsName[0] = '\0';
+    if (cls >= HUNT_PTR_MIN)
+        class_name_at(task, cls, 0x10, meta, clsName, sizeof(clsName));
+
+    [self vlogLine:@"VIEW SPINE: head=0x%llx run=%d nodes stride=0x%llx readable=%zu class=0x%llx name=%s",
+                (unsigned long long)head, runLen,
+                (unsigned long long)VIEW_SPINE_STRIDE, have,
+                (unsigned long long)cls, clsName[0] ? clsName : "?"];
+
+    for (size_t off = 0; off < sizeof(raw); off += 16) {
+        size_t rowLen = sizeof(raw) - off;
+        if (rowLen > 16)
+            rowLen = 16;
+
+        char hex[16 * 3 + 4];
+        size_t hp = 0;
+        hex[0] = '\0';
+        for (size_t b = 0; b < rowLen && hp + 4 < sizeof(hex); b++)
+            hp += (size_t)snprintf(hex + hp, sizeof(hex) - hp, "%02x ", raw[off + b]);
+
+        char fl[160];
+        size_t fp = 0;
+        fl[0] = '\0';
+        for (size_t b = 0; b + 4 <= rowLen; b += 4) {
+            float f = 0.0f;
+            memcpy(&f, raw + off + b, sizeof(f));
+            fp += (size_t)snprintf(fl + fp, sizeof(fl) - fp, "%13.4f ", f);
+        }
+
+        [self vlogLine:@"VIEW SPINE +0x%02zx  %-48s | %s", off, hex, fl];
+    }
+}
+
+/* Scans one VIEW-phase region: tags every float slot, diffs every slot against
+   the previous scan, then emits changed slots (old -> new) and MAT? blocks. */
+- (void)viewScanRegion:(const view_region *)reg
+                  task:(mach_port_t)task
+                  prev:(NSDictionary *)prev
+                  next:(NSMutableDictionary *)next
+                 probe:(uint64_t)probe
+                 stats:(view_stats *)vs
+            screenLeft:(int *)left
+{
+    size_t want = reg->len;
+    if (want < 16)
+        return;
+
+    uint8_t *raw = (uint8_t *)malloc(want);
+    float *fv = (float *)malloc(want);
+    uint8_t *tag = (uint8_t *)calloc(want / 4, 1);
+    uint8_t *chg = (uint8_t *)calloc(want / 4, 1);
+
+    if (!raw || !fv || !tag || !chg) {
+        free(raw);
+        free(fv);
+        free(tag);
+        free(chg);
+        return;
+    }
+
+    size_t have = hunt_read_obj(task, reg->addr, raw, want);
+    int nslots = (int)(have / 4);
+
+    if (nslots < 4) {
+        free(raw);
+        free(fv);
+        free(tag);
+        free(chg);
+        return;
+    }
+
+    memcpy(fv, raw, (size_t)nslots * sizeof(float));
+
+    int rpos = 0;
+    int rdir = 0;
+    int rmat = 0;
+
+    for (int i = 0; i + 3 <= nslots; i++) {
+        if (view_pos_ok(fv + i)) {
+            rpos++;
+            tag[i] |= VIEW_TAG_POS_START;
+            tag[i + 1] |= VIEW_TAG_POS_MEMBER;
+            tag[i + 2] |= VIEW_TAG_POS_MEMBER;
+        }
+
+        if (view_dir_ok(fv + i, NULL)) {
+            rdir++;
+            if (i + 3 < nslots && fv[i + 3] == 0.0f)
+                tag[i] |= VIEW_TAG_DIR4_START;
+            else
+                tag[i] |= VIEW_TAG_DIR_START;
+            tag[i + 1] |= VIEW_TAG_DIR_MEMBER;
+            tag[i + 2] |= VIEW_TAG_DIR_MEMBER;
+        }
+    }
+
+    for (int i = 0; i + 16 <= nslots; i++) {
+        if (((reg->addr + (uint64_t)i * 4) & 0xFULL) != 0)
+            continue;
+        if (!view_mat_ok(fv + i))
+            continue;
+        rmat++;
+        tag[i] |= VIEW_TAG_MAT_START;
+        for (int k = 1; k < 16; k++)
+            tag[i + k] |= VIEW_TAG_MAT_MEMBER;
+    }
+
+    /* Differential pass: one dictionary lookup per slot, no output yet. */
+    int rchg = 0;
+
+    for (int i = 0; i < nslots; i++) {
+        uint32_t bits = 0;
+        memcpy(&bits, raw + (size_t)i * 4, sizeof(bits));
+
+        uint64_t slotAddr = reg->addr + (uint64_t)i * 4;
+        NSNumber *key = [NSNumber numberWithUnsignedLongLong:slotAddr];
+        NSNumber *oldNum = prev[key];
+
+        if (oldNum) {
+            if ([oldNum unsignedIntValue] != bits) {
+                chg[i] = 1;
+                rchg++;
+            }
+        } else {
+            chg[i] = 2;
+            vs->added++;
+        }
+
+        next[key] = [NSNumber numberWithUnsignedInt:bits];
+    }
+
+    vs->slots += nslots;
+    vs->pos += rpos;
+    vs->dir += rdir;
+    vs->mat += rmat;
+    vs->changed += rchg;
+
+    [self vlogLine:@"VIEW REG %s base=0x%llx len=0x%zx slots=%d pos=%d dir=%d mat=%d chg=%d",
+                reg->path, (unsigned long long)reg->addr, have, nslots,
+                rpos, rdir, rmat, rchg];
+
+    /* File-only probe of the run #22 anchors: view position and direction. */
+    if (probe && reg->addr == probe) {
+        for (int off = 0x120; off <= 0x130; off += 0x10) {
+            int i = off / 4;
+            if (i + 3 >= nslots)
+                continue;
+            [self vlogLine:@"VIEW probe T+0x%03x = (%.4f,%.4f,%.4f,%.4f) tag=%s",
+                        off, fv[i], fv[i + 1], fv[i + 2], fv[i + 3],
+                        view_tag_name(tag[i])];
+        }
+    }
+
+    /* Emission pass 1: every changed slot, offset order. These come first so
+       the 60-line screen budget is spent on real motion, not on static
+       matrices. */
+    for (int i = 0; i < nslots; i++) {
+        if (gStopRequested.load())
+            break;
+        if (chg[i] != 1)
+            continue;
+
+        NSNumber *key = [NSNumber numberWithUnsignedLongLong:
+                         reg->addr + (uint64_t)i * 4];
+        uint32_t oldBits = [[prev objectForKey:key] unsignedIntValue];
+        float oldF = 0.0f;
+        memcpy(&oldF, &oldBits, sizeof(oldF));
+
+        [self viewEmit:[NSString stringWithFormat:
+                        @"VIEW chg %s +0x%03x  %.4f -> %.4f  [%s]",
+                        reg->path, (unsigned)(i * 4), oldF, fv[i],
+                        view_tag_name(tag[i])]
+            screenLeft:left];
+    }
+
+    /* Emission pass 2: every MAT? block, changed or not, offset order. */
+    for (int i = 0; i < nslots; i++) {
+        if (gStopRequested.load())
+            break;
+        if (!(tag[i] & VIEW_TAG_MAT_START))
+            continue;
+
+        [self viewEmit:[NSString stringWithFormat:
+                        @"VIEW MAT %s +0x%03x  %8.3f %8.3f %8.3f %8.3f | "
+                        @"%8.3f %8.3f %8.3f %8.3f | "
+                        @"%8.3f %8.3f %8.3f %8.3f | "
+                        @"%8.3f %8.3f %8.3f %8.3f",
+                        reg->path, (unsigned)(i * 4),
+                        fv[i + 0], fv[i + 1], fv[i + 2], fv[i + 3],
+                        fv[i + 4], fv[i + 5], fv[i + 6], fv[i + 7],
+                        fv[i + 8], fv[i + 9], fv[i + 10], fv[i + 11],
+                        fv[i + 12], fv[i + 13], fv[i + 14], fv[i + 15]]
+                    screenLeft:left];
+    }
+
+    free(raw);
+    free(fv);
+    free(tag);
+    free(chg);
+}
+
+/* Screen while the 60-line budget lasts, verbose file always. */
+- (void)viewEmit:(NSString *)line screenLeft:(int *)left
+{
+    if (left && *left > 0) {
+        [self logLine:@"%@", line];
+        (*left)--;
+    } else {
+        [self vlogLine:@"%@", line];
+    }
 }
 
 @end
