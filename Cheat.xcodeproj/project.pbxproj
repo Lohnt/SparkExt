@@ -17,6 +17,8 @@
 		A20000000000000000000008 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000F /* UIKit.framework */; };
 		A20000000000000000000009 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000010 /* CoreGraphics.framework */; };
 		A2000000000000000000000A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* Assets.xcassets */; };
+		A2000000000000000000000B /* DiagScan.mm in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* DiagScan.mm */; };
+		A2000000000000000000000C /* EspDraw.mm in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* EspDraw.mm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -38,6 +40,10 @@
 		A10000000000000000000010 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		A10000000000000000000012 /* SBSAccessibilityWindowHostingController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SBSAccessibilityWindowHostingController.h; sourceTree = "<group>"; };
 		A10000000000000000000013 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A10000000000000000000014 /* DiagScan.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = DiagScan.mm; sourceTree = "<group>"; };
+		A10000000000000000000015 /* EspDraw.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = EspDraw.h; sourceTree = "<group>"; };
+		A10000000000000000000016 /* EspDraw.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = EspDraw.mm; sourceTree = "<group>"; };
+		A10000000000000000000017 /* DiagPrivate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = DiagPrivate.h; sourceTree = "<group>"; };
 		A00000000000000000000008 /* Diag.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Diag.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -83,6 +89,10 @@
 				A10000000000000000000005 /* OverlayWindow.mm */,
 				A10000000000000000000006 /* DiagViewController.h */,
 				A10000000000000000000007 /* DiagViewController.mm */,
+				A10000000000000000000017 /* DiagPrivate.h */,
+				A10000000000000000000014 /* DiagScan.mm */,
+				A10000000000000000000015 /* EspDraw.h */,
+				A10000000000000000000016 /* EspDraw.mm */,
 				A10000000000000000000008 /* MemRead.h */,
 				A10000000000000000000009 /* MemRead.mm */,
 				A1000000000000000000000A /* Il2Cpp.h */,
@@ -184,6 +194,8 @@
 				A20000000000000000000002 /* AppDelegate.mm in Sources */,
 				A20000000000000000000003 /* OverlayWindow.mm in Sources */,
 				A20000000000000000000004 /* DiagViewController.mm in Sources */,
+				A2000000000000000000000B /* DiagScan.mm in Sources */,
+				A2000000000000000000000C /* EspDraw.mm in Sources */,
 				A20000000000000000000005 /* MemRead.mm in Sources */,
 				A20000000000000000000006 /* Il2Cpp.mm in Sources */,
 			);
