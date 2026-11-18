@@ -65,8 +65,11 @@
 #define PLANET_CAP_BYTES    (320ULL * 1024ULL * 1024ULL)
 #define PLANET_REGION_MAX   8192
 #define PLANET_CHANGED_MAX  (2u * 1024u * 1024u)
-#define PLANET_WIN          0x60
-#define PLANET_WIN_BACK     0x20
+#define PLANET_WIN          0x100    /* dump window per changed block */
+#define PLANET_WIN_BACK     0x80
+#define PLANET_TEST_BACK    0x20     /* test window starts here, before block */
+#define PLANET_TEST_OFF     0x60     /* same bytes inside the dump window */
+#define PLANET_TEST_LEN     0x60
 #define PLANET_SCREEN_CLU   40
 #define PLANET_SCREEN_MOVED 40
 #define PLANET_CLUSTER_GAP  0x1000ULL
@@ -74,6 +77,18 @@
 #define PLANET_SELF_WIN     0x200
 #define PLANET_SELF_RADIUS  3.0f
 #define PLANET_MOVER_MAX    200000
+
+/* --- round 26: TRS transform chains, PERSIST, GHOST --------------------- */
+#define PLANET_TRS_STRIDE   0x30ULL
+#define PLANET_TRS_CHUNK    0x300000u
+#define PLANET_TRS_GAP      0x1000ULL
+#define PLANET_TRS_ARRAYS   40
+#define PLANET_TRS_POS      12
+#define PLANET_TRS_OUT_MAX  4000
+#define PLANET_TRS_COLLECT  200000   /* slots kept for grouping */
+#define PLANET_GHOST_LO     0x16c140000ULL
+#define PLANET_GHOST_HI     0x16c150000ULL
+#define PLANET_GHOST_MAX    128
 
 /* --- il2cpp class metadata ---------------------------------------------- */
 #define ACTOR_NAME_EXPECT  "O7D1D7DB39"
@@ -763,6 +778,89 @@ static int mover_cmp_desc(const void *a, const void *b)
     return 0;
 }
 
+/* One Unity transform block: position at +0x00, unit quaternion at +0x10,
+   uniform scale triple at +0x20, stride 0x30. */
+typedef struct {
+    uint64_t addr;
+    float px, py, pz;
+} trs_slot;
+
+/* A run of consecutive TRS slots, the transform array / chain. */
+typedef struct {
+    uint64_t base;
+    int count;
+    int first;
+} trs_array;
+
+/* The TRS test: finite in-map position, unit quaternion, uniform scale in
+   [0.1,10]. */
+static bool planet_trs_ok(const uint8_t *p, float *posOut)
+{
+    float pos[3];
+    float q[4];
+    float sc[3];
+
+    memcpy(pos, p, sizeof(pos));
+    memcpy(q, p + 0x10, sizeof(q));
+    memcpy(sc, p + 0x20, sizeof(sc));
+
+    if (!isfinite(pos[0]) || !isfinite(pos[1]) || !isfinite(pos[2]))
+        return false;
+    if (fabsf(pos[0]) >= 3000.0f || fabsf(pos[2]) >= 3000.0f)
+        return false;
+    if (fabsf(pos[1]) >= 50.0f)
+        return false;
+
+    for (int i = 0; i < 4; i++) {
+        if (!isfinite(q[i]))
+            return false;
+    }
+
+    float qlen = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (qlen < 0.98f || qlen > 1.02f)
+        return false;
+
+    for (int i = 0; i < 3; i++) {
+        if (!isfinite(sc[i]) || sc[i] < 0.1f || sc[i] > 10.0f)
+            return false;
+    }
+
+    if (fabsf(sc[0] - sc[1]) > 0.001f || fabsf(sc[1] - sc[2]) > 0.001f ||
+        fabsf(sc[0] - sc[2]) > 0.001f)
+        return false;
+
+    /* Cleared transform: exact identity at a zero position. These fill freed
+       Unity pools by the thousand and would swamp the slot list. */
+    if (pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f &&
+        q[0] == 0.0f && q[1] == 0.0f && q[2] == 0.0f && q[3] == 1.0f &&
+        sc[0] == 1.0f && sc[1] == 1.0f && sc[2] == 1.0f)
+        return false;
+
+    if (posOut) {
+        posOut[0] = pos[0];
+        posOut[1] = pos[1];
+        posOut[2] = pos[2];
+    }
+    return true;
+}
+
+static int trs_cmp_addr(const void *a, const void *b)
+{
+    const trs_slot *x = (const trs_slot *)a;
+    const trs_slot *y = (const trs_slot *)b;
+    return x->addr < y->addr ? -1 : (x->addr > y->addr ? 1 : 0);
+}
+
+static int trs_cmp_count(const void *a, const void *b)
+{
+    const trs_array *x = (const trs_array *)a;
+    const trs_array *y = (const trs_array *)b;
+
+    if (x->count != y->count)
+        return x->count > y->count ? -1 : 1;
+    return x->base < y->base ? -1 : (x->base > y->base ? 1 : 0);
+}
+
 /* 16-bit fingerprint of one 0x20 block: XOR-fold its eight u32 words. */
 static uint16_t planet_hash_block(const uint8_t *p)
 {
@@ -1211,6 +1309,14 @@ stopped:
        the insertion order used to keep that history at 200k addresses. */
     NSMutableDictionary *_moverHist;
     NSMutableArray *_moverOrder;
+
+    /* Round 26: per-address SELF distance from the previous scan (PERSIST),
+       the posAddr list of this scan's top movers, dumped again next scan
+       (MOVE AFTER), and the previous scan's camera P (GHOST rule). */
+    NSMutableDictionary *_selfPrev;
+    NSMutableArray *_moverWatch;
+    float _prevSelfP[3];
+    BOOL _prevSelfValid;
 }
 
 - (void)appendLog:(NSString *)line;
@@ -1257,6 +1363,9 @@ stopped:
                 candidates:(const cand_t *)cands
                      count:(int)count;
 - (void)runPlanetaryTask:(mach_port_t)task;
+- (void)runTrsHuntTask:(mach_port_t)task
+               regions:(const planet_region *)regs
+                 count:(int)count;
 
 @end
 
@@ -1280,6 +1389,10 @@ stopped:
     _planetNRegs = 0;
     _moverHist = [NSMutableDictionary dictionary];
     _moverOrder = [NSMutableArray array];
+    _selfPrev = [NSMutableDictionary dictionary];
+    _moverWatch = [NSMutableArray array];
+    _prevSelfP[0] = _prevSelfP[1] = _prevSelfP[2] = 0.0f;
+    _prevSelfValid = NO;
 
     self.view.backgroundColor = [UIColor blackColor];
 
@@ -2669,6 +2782,187 @@ stopped:
         [self logLine:@"scan stopped"];
 }
 
+/* ---------------- TRS transform-chain hunt ------------------------------ */
+
+/* Independent of the changed blocks: walks the same region list PLANETARY A
+   built and tests every absolute 0x30-aligned block for a Unity transform -
+   position at +0x00, unit quaternion at +0x10, uniform scale triple at +0x20.
+   Slots are grouped into arrays by 0x30-consecutiveness (gap <= 0x1000). The
+   summary is on screen; the array list and the position lists go to the file,
+   with the array listing capped at 4000 slots. */
+- (void)runTrsHuntTask:(mach_port_t)task
+               regions:(const planet_region *)regs
+                 count:(int)count
+{
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+
+    trs_slot *slots = (trs_slot *)malloc((size_t)PLANET_TRS_COLLECT * sizeof(trs_slot));
+    uint8_t *chunk = (uint8_t *)malloc(PLANET_TRS_CHUNK);
+
+    if (!slots || !chunk) {
+        free(slots);
+        free(chunk);
+        [self logLine:@"TRS failed: out of memory"];
+        return;
+    }
+
+    int nslots = 0;
+    uint64_t scanned = 0;
+    int reads = 0;
+    int readFails = 0;
+    bool capped = false;
+    bool stopped = false;
+
+    for (int r = 0; r < count && !capped; r++) {
+        if (gStopRequested.load()) {
+            stopped = true;
+            break;
+        }
+
+        uint64_t end = regs[r].base + regs[r].size;
+        uint64_t p = regs[r].base;
+        uint64_t mis = p % PLANET_TRS_STRIDE;
+
+        if (mis)
+            p += PLANET_TRS_STRIDE - mis;
+
+        while (p + PLANET_TRS_STRIDE <= end) {
+            if (gStopRequested.load()) {
+                stopped = true;
+                break;
+            }
+
+            uint64_t left = end - p;
+            size_t want = (size_t)(left < (uint64_t)PLANET_TRS_CHUNK
+                                   ? left : (uint64_t)PLANET_TRS_CHUNK);
+            want -= want % (size_t)PLANET_TRS_STRIDE;
+            if (want == 0)
+                break;
+
+            if (mr_read(task, p, chunk, want)) {
+                reads++;
+            } else {
+                /* Page-level retry; zeroed stretches fail the quat test, so
+                   they cannot fake a TRS slot. */
+                readFails++;
+                for (size_t done = 0; done < want; ) {
+                    size_t sub = want - done;
+                    if (sub > 0x10000)
+                        sub = 0x10000;
+                    if (!mr_read(task, p + done, chunk + done, sub))
+                        memset(chunk + done, 0, sub);
+                    done += sub;
+                }
+            }
+
+            size_t nblk = want / (size_t)PLANET_TRS_STRIDE;
+
+            for (size_t b = 0; b < nblk; b++) {
+                float pos[3];
+                const uint8_t *bp = chunk + b * (size_t)PLANET_TRS_STRIDE;
+
+                if (!planet_trs_ok(bp, pos))
+                    continue;
+
+                if (nslots >= PLANET_TRS_COLLECT) {
+                    capped = true;
+                    break;
+                }
+
+                slots[nslots].addr = p + (uint64_t)b * PLANET_TRS_STRIDE;
+                slots[nslots].px = pos[0];
+                slots[nslots].py = pos[1];
+                slots[nslots].pz = pos[2];
+                nslots++;
+            }
+
+            scanned += want;
+            p += want;
+        }
+    }
+
+    free(chunk);
+
+    qsort(slots, (size_t)nslots, sizeof(trs_slot), trs_cmp_addr);
+
+    /* Group into arrays: a gap of more than 0x1000 starts a new one. */
+    trs_array *arrs = (trs_array *)malloc(
+        (size_t)(nslots > 0 ? nslots : 1) * sizeof(trs_array));
+    int narr = 0;
+
+    if (arrs) {
+        for (int i = 0; i < nslots; i++) {
+            if (narr == 0 || slots[i].addr - slots[i - 1].addr > PLANET_TRS_GAP) {
+                arrs[narr].base = slots[i].addr;
+                arrs[narr].count = 0;
+                arrs[narr].first = i;
+                narr++;
+            }
+            arrs[narr - 1].count++;
+        }
+    }
+
+    [self logLine:@"TRS: %d slots in %d arrays", nslots, narr];
+
+    [self vlogLine:@"trs: scanned=%.1f MB reads=%d fails=%d collect=%d/%d %s%s elapsed=%.2f",
+                (double)scanned / (1024.0 * 1024.0), reads, readFails,
+                nslots, PLANET_TRS_COLLECT,
+                capped ? "CAPPED " : "", stopped ? "STOPPED " : "",
+                CFAbsoluteTimeGetCurrent() - t0];
+
+    if (arrs && narr > 0) {
+        int listed = 0;
+
+        for (int i = 0; i < narr; i++) {
+            if (listed > 0 && listed + arrs[i].count > PLANET_TRS_OUT_MAX)
+                break;
+            [self vlogLine:@"TRS array base=0x%llx count=%d",
+                        (unsigned long long)arrs[i].base, arrs[i].count];
+            listed += arrs[i].count;
+        }
+
+        if (listed < nslots)
+            [self vlogLine:@"trs: array listing stopped at %d of %d slots",
+                        listed, nslots];
+
+        /* The 40 densest arrays get their position list: those are the ones
+           that are actually transform chains (root + bones). */
+        trs_array *big = (trs_array *)malloc((size_t)narr * sizeof(trs_array));
+
+        if (big) {
+            memcpy(big, arrs, (size_t)narr * sizeof(trs_array));
+            qsort(big, (size_t)narr, sizeof(trs_array), trs_cmp_count);
+
+            for (int i = 0; i < narr && i < PLANET_TRS_ARRAYS; i++) {
+                [self vlogLine:@"TRS big base=0x%llx count=%d",
+                            (unsigned long long)big[i].base, big[i].count];
+            }
+
+            int listedPos = 0;
+
+            for (int i = 0; i < narr && i < PLANET_TRS_ARRAYS; i++) {
+                int start = big[i].first;
+                int n = big[i].count;
+                if (n > PLANET_TRS_POS)
+                    n = PLANET_TRS_POS;
+
+                for (int k = 0; k < n && listedPos < PLANET_TRS_OUT_MAX; k++) {
+                    trs_slot *s = &slots[start + k];
+                    [self vlogLine:@"TRS pos base=0x%llx 0x%llx (%.3f,%.3f,%.3f)",
+                                (unsigned long long)big[i].base,
+                                (unsigned long long)s->addr,
+                                s->px, s->py, s->pz];
+                    listedPos++;
+                }
+            }
+            free(big);
+        }
+    }
+
+    free(arrs);
+    free(slots);
+}
+
 /* ---------------- PLANETARY full-heap differential ---------------------- */
 
 /* Two-pass, whole-heap differential. Pass A enumerates every readable+writable
@@ -2915,6 +3209,7 @@ stopped:
 
     int entities = 0;
     int selfHits = 0;
+    int persistHits = 0;
     int clusters = 0;
     uint64_t *entAddrs = NULL;
     int entN = 0;
@@ -2930,6 +3225,72 @@ stopped:
     int staticCount = 0;
     int tracked = 0;
 
+    /* PERSIST: per-position-address SELF distance, rebuilt each scan. */
+    NSMutableDictionary *selfPrevNext = [NSMutableDictionary dictionary];
+
+    /* GHOST: at most PLANET_GHOST_MAX 0x200 windows, one per address. */
+    NSMutableSet *ghostSeen = [NSMutableSet set];
+    __block int ghostCount = 0;
+
+    /* 0x200 hex+float window centred on addr, to the file only. */
+    void (^dumpWin)(uint64_t, const char *, const char *) =
+        ^(uint64_t addr, const char *label, const char *why) {
+            uint64_t base = (addr > 0x100) ? addr - 0x100 : addr;
+            uint8_t *w = (uint8_t *)malloc(PLANET_SELF_WIN);
+
+            if (!w)
+                return;
+
+            memset(w, 0, PLANET_SELF_WIN);
+            size_t got = hunt_read_obj(task, base, w, PLANET_SELF_WIN);
+
+            if (why)
+                [self vlogLine:@"%s WIN 0x%llx readable=0x%zx (for 0x%llx) rule=%s",
+                            label, (unsigned long long)base, got,
+                            (unsigned long long)addr, why];
+            else
+                [self vlogLine:@"%s WIN 0x%llx readable=0x%zx (for 0x%llx)",
+                            label, (unsigned long long)base, got,
+                            (unsigned long long)addr];
+
+            [self viewDumpRows:w have:got label:label];
+            free(w);
+        };
+
+    void (^ghostDump)(uint64_t, const char *) = ^(uint64_t addr, const char *why) {
+        if (ghostCount >= PLANET_GHOST_MAX)
+            return;
+
+        NSNumber *k = [NSNumber numberWithUnsignedLongLong:addr];
+        if ([ghostSeen containsObject:k])
+            return;
+
+        [ghostSeen addObject:k];
+        ghostCount++;
+        dumpWin(addr, "GHOST", why);
+    };
+
+    /* Deferred before/after windows: the same posAddr one scan later, so the
+       layout of last scan's top movers can be compared in place. */
+    if (_moverWatch.count > 0) {
+        for (NSNumber *num in _moverWatch) {
+            uint64_t addr = [num unsignedLongLongValue];
+            uint64_t base = (addr > PLANET_WIN / 2) ? addr - PLANET_WIN / 2 : addr;
+            uint8_t *w = (uint8_t *)malloc(PLANET_WIN);
+
+            if (!w)
+                break;
+
+            memset(w, 0, PLANET_WIN);
+            size_t got = hunt_read_obj(task, base, w, PLANET_WIN);
+            [self vlogLine:@"MOVE AFTER 0x%llx base=0x%llx readable=0x%zx",
+                        (unsigned long long)addr, (unsigned long long)base, got];
+            [self viewDumpRows:w have:got label:@"MAFTER"];
+            free(w);
+        }
+        [_moverWatch removeAllObjects];
+    }
+
     if (chgStored > 0) {
         entAddrs = (uint64_t *)malloc((size_t)chgStored * sizeof(uint64_t));
         uint8_t win[PLANET_WIN];
@@ -2939,18 +3300,22 @@ stopped:
                 break;
 
             uint64_t blockAddr = chg[(chgHead - chgStored + i) % PLANET_CHANGED_MAX];
-            if (blockAddr < PLANET_WIN_BACK)
+            if (blockAddr < PLANET_TEST_BACK)
                 continue;
 
-            uint64_t wbase = blockAddr - PLANET_WIN_BACK;
-            memset(win, 0, sizeof(win));
-            size_t have = hunt_read_obj(task, wbase, win, PLANET_WIN);
+            /* Detection window is unchanged: the 0x60 bytes starting 0x20
+               before the changed block. The wider 0x100 dump is read
+               separately so a region edge cannot cost us the record itself. */
+            uint64_t twbase = blockAddr - PLANET_TEST_BACK;
+            uint8_t twin[PLANET_TEST_LEN];
+            memset(twin, 0, sizeof(twin));
+            size_t have = hunt_read_obj(task, twbase, twin, PLANET_TEST_LEN);
             if (have < 16)
                 continue;
 
             int nf = (int)((have & ~(size_t)3) / 4);
-            float f[PLANET_WIN / 4];
-            memcpy(f, win, (size_t)nf * sizeof(float));
+            float f[PLANET_TEST_LEN / 4];
+            memcpy(f, twin, (size_t)nf * sizeof(float));
 
             int posOff = -1;
             for (int o = 0; o + 3 <= nf; o++) {
@@ -2995,15 +3360,21 @@ stopped:
 
             entities++;
 
-            uint64_t posAddr = wbase + (uint64_t)posOff * 4;
+            uint64_t posAddr = twbase + (uint64_t)posOff * 4;
+
+            /* Wider 0x100 dump window, centred on the changed block. */
+            uint64_t wbase = (blockAddr > PLANET_WIN_BACK) ? blockAddr - PLANET_WIN_BACK : blockAddr;
+            memset(win, 0, sizeof(win));
+            size_t whave = hunt_read_obj(task, wbase, win, PLANET_WIN);
 
             [self vlogLine:@"ENT 0x%llx pos=(%.3f,%.3f,%.3f) dir=(%.3f,%.3f,%.3f) posAddr=0x%llx",
                         (unsigned long long)blockAddr, px, py, pz, dx, dy, dz,
                         (unsigned long long)posAddr];
             [self vlogLine:@"ENT WIN 0x%llx pos+0x%03x dir+0x%03x",
-                        (unsigned long long)wbase, (unsigned)(posOff * 4),
-                        (unsigned)(dirOff * 4)];
-            [self viewDumpRows:win have:have label:"ENT"];
+                        (unsigned long long)wbase,
+                        (unsigned)(PLANET_TEST_OFF + posOff * 4),
+                        (unsigned)(PLANET_TEST_OFF + dirOff * 4)];
+            [self viewDumpRows:win have:whave label:"ENT"];
 
             /* SELF: the candidate sitting on the local camera. Never truncated
                - this is the player-table locator. */
@@ -3018,18 +3389,25 @@ stopped:
                     [self logLine:@"SELF 0x%llx pos=(%.3f,%.3f,%.3f) dir=(%.3f,%.3f,%.3f) d=%.2f",
                                (unsigned long long)blockAddr, px, py, pz, dx, dy, dz, sd];
 
-                    uint64_t dumpBase = (blockAddr > 0x100) ? blockAddr - 0x100 : blockAddr;
-                    uint8_t *win2 = (uint8_t *)malloc(PLANET_SELF_WIN);
+                    dumpWin(blockAddr, "SELF", NULL);
 
-                    if (win2) {
-                        memset(win2, 0, PLANET_SELF_WIN);
-                        size_t have2 = hunt_read_obj(task, dumpBase, win2, PLANET_SELF_WIN);
-                        [self vlogLine:@"SELF WIN 0x%llx readable=0x%zx (for 0x%llx)",
-                                    (unsigned long long)dumpBase, have2,
-                                    (unsigned long long)posAddr];
-                        [self viewDumpRows:win2 have:have2 label:"SELF"];
-                        free(win2);
+                    /* PERSIST: tight match now, and the same address was a
+                       SELF hit in the previous scan as well. */
+                    NSNumber *prevD = _selfPrev[[NSNumber numberWithUnsignedLongLong:blockAddr]];
+
+                    if (sd <= 0.05f && prevD && [prevD floatValue] <= 0.5f) {
+                        persistHits++;
+                        [self logLine:@"PERSIST 0x%llx d1=%.2f d2=%.2f",
+                                   (unsigned long long)blockAddr,
+                                   [prevD floatValue], sd];
+                        dumpWin(blockAddr, "PERSIST", NULL);
                     }
+
+                    if (sd <= 0.5f)
+                        selfPrevNext[[NSNumber numberWithUnsignedLongLong:blockAddr]] = @(sd);
+
+                    if (blockAddr >= PLANET_GHOST_LO && blockAddr < PLANET_GHOST_HI)
+                        ghostDump(blockAddr, "range");
                 }
             }
 
@@ -3046,6 +3424,25 @@ stopped:
                 float mdy = py - oldp[1];
                 float mdz = pz - oldp[2];
                 float dist = sqrtf(mdx * mdx + mdy * mdy + mdz * mdz);
+
+                /* GHOST: the mystery range, or a block that sat on the
+                   previous scan's camera and then jumped well away from it. */
+                if (posAddr >= PLANET_GHOST_LO && posAddr < PLANET_GHOST_HI) {
+                    ghostDump(posAddr, "range");
+                } else if (_prevSelfValid) {
+                    float ox = oldp[0] - _prevSelfP[0];
+                    float oy = oldp[1] - _prevSelfP[1];
+                    float oz = oldp[2] - _prevSelfP[2];
+                    float oDist = sqrtf(ox * ox + oy * oy + oz * oz);
+
+                    float ax = px - _prevSelfP[0];
+                    float ay = py - _prevSelfP[1];
+                    float az = pz - _prevSelfP[2];
+                    float nDist = sqrtf(ax * ax + ay * ay + az * az);
+
+                    if (oDist <= 1.0f && nDist > 5.0f)
+                        ghostDump(posAddr, "cam");
+                }
 
                 if (dist <= 0.001f) {
                     staticCount++;
@@ -3083,6 +3480,15 @@ stopped:
         }
     }
 
+    /* PERSIST state for the next scan (also clears it when nothing matched). */
+    _selfPrev = selfPrevNext;
+
+    if (persistHits > 0)
+        [self vlogLine:@"persist: %d address(es) hit tightly twice in a row", persistHits];
+
+    if (ghostCount > 0)
+        [self vlogLine:@"ghost: %d windows dumped (cap %d)", ghostCount, PLANET_GHOST_MAX];
+
     /* Ring of PLANET_MOVER_MAX position addresses; evict in batches. */
     if (_moverOrder.count > PLANET_MOVER_MAX) {
         NSUInteger drop = _moverOrder.count - PLANET_MOVER_MAX;
@@ -3110,6 +3516,11 @@ stopped:
 
     if (movedN > 0) {
         qsort(movedList, (size_t)movedN, sizeof(mover_rec), mover_cmp_desc);
+
+        /* Keep this scan's top 20 for next scan's MOVE AFTER dump. */
+        for (int i = 0; i < movedN && i < 20; i++)
+            [_moverWatch addObject:
+             [NSNumber numberWithUnsignedLongLong:movedList[i].addr]];
 
         for (int i = 0; i < movedN; i++) {
             mover_rec *mr = &movedList[i];
@@ -3165,6 +3576,21 @@ stopped:
 
     free(entAddrs);
     free(chg);
+
+    /* TRS runs over the same region list A built, and its summary closes the
+       screen for this scan. */
+    if (!gStopRequested.load())
+        [self runTrsHuntTask:task regions:sel count:nsel];
+
+    /* This scan's camera P becomes the GHOST reference for the next one. */
+    if (haveSelfP) {
+        _prevSelfP[0] = selfP[0];
+        _prevSelfP[1] = selfP[1];
+        _prevSelfP[2] = selfP[2];
+        _prevSelfValid = YES;
+    } else {
+        _prevSelfValid = NO;
+    }
 
     /* Ring of one: this scan's hashes become the next scan's baseline. */
     _planetRegs = sel;
