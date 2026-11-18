@@ -854,12 +854,13 @@ static bool planet_trs_ok(const uint8_t *p, float *posOut)
 
 /* Round 30 humanoid signature. Practice bots ship a 60-70 slot skeleton whose
    first slots are not at the old slot2 head height, but the chain still walks
-   feet -> head: one of slot0..slot3 sits at y 0.90..1.00 and the four bone gaps
-   below follow within the next eight slots. Returns the head slot index, or -1
-   when the array is not a humanoid. */
+   feet -> head. Round 31 correction: the four numbers are the ABSOLUTE y of the
+   slots that follow the head, not gaps between them. Matched fingerprint:
+   head y 0.940, then 0.121, 0.146, 0.138, 0.105. Returns the head slot index,
+   or -1 when the array is not a humanoid. */
 static int human_sig_start(const uint8_t *raw, int rows)
 {
-    static const float kGap[4] = { 0.121f, 0.146f, 0.138f, 0.105f };
+    static const float kAbs[4] = { 0.121f, 0.146f, 0.138f, 0.105f };
 
     if (!raw || rows < PLANET_HUMAN_ROWS)
         return -1;
@@ -877,22 +878,15 @@ static int human_sig_start(const uint8_t *raw, int rows)
         if (y[i] < PLANET_HUMAN_HEADLO || y[i] > PLANET_HUMAN_HEADHI)
             continue;
 
-        int found = 0;
-        for (int g = 0; g < 4; g++) {
-            bool hit = false;
-            for (int j = i; j + 1 < PLANET_HUMAN_ROWS && j <= i + 6; j++) {
-                float d = y[j + 1] - y[j];
-                if (fabsf(d - kGap[g]) <= 0.01f) {
-                    hit = true;
-                    break;
-                }
-            }
-            if (!hit)
+        int ok = 1;
+        for (int k = 0; k < 4; k++) {
+            if (fabsf(y[i + 1 + k] - kAbs[k]) > 0.01f) {
+                ok = 0;
                 break;
-            found++;
+            }
         }
 
-        if (found == 4)
+        if (ok)
             return i;
     }
 
