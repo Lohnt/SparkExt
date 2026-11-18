@@ -1561,7 +1561,8 @@ stopped:
 
 
 @interface DiagViewController (CameraMain)
-- (BOOL)resolveMainCameraPos:(float *)posOut fwd:(float *)fwdOut kind:(int *)kindOut;
+- (BOOL)resolveMainCameraPos:(float *)posOut fwd:(float *)fwdOut kind:(int *)kindOut
+                    regions:(const planet_region *)regs count:(int)count;
 @end
 
 @implementation DiagViewController (Scan)
@@ -2756,6 +2757,93 @@ stopped:
         [self logLine:@"scan stopped"];
 }
 
+/* Round 35: last-resort instance finder. Walks the planetary region list,
+   looks for the Camera class pointer in the object header of an aligned word,
+   and validates the object through the same native/TRS probe. Stops at the
+   first object that yields a transform, so a normal scan only re-reads until
+   the camera is met. Budget caps the extra reads at 160 MB. */
+static bool cam_heap_scan(mach_port_t task, const planet_region *regs, int count,
+                          uint64_t cls, uint64_t tfCls, float *pos, float *quat,
+                          uint64_t *objOut)
+{
+    if (!regs || count <= 0 || !cls)
+        return false;
+
+    size_t budget = 160u * 1024u * 1024u;
+    uint8_t *buf = (uint8_t *)malloc(1u << 20);
+
+    if (!buf)
+        return false;
+
+    bool found = false;
+
+    for (int r = 0; r < count && budget && !found; r++) {
+        uint64_t base = regs[r].base;
+        uint64_t size = regs[r].size;
+
+        if (!base || size < 8)
+            continue;
+
+        uint64_t off = 0;
+
+        while (off + 8 <= size && budget && !found) {
+            size_t want = (size_t)((size - off > (1u << 20)) ? (1u << 20)
+                                                            : (size - off));
+            want &= ~(size_t)7;
+
+            if (!want)
+                break;
+
+            size_t got = hunt_read_obj(task, base + off, buf, want);
+            size_t step = got & ~(size_t)7;
+
+            for (size_t i = 0; i + 8 <= step; i += 8) {
+                uint64_t v = 0;
+                memcpy(&v, buf + i, sizeof(v));
+                if (v != cls)
+                    continue;
+
+                uint64_t obj = base + off + i;
+                if (cam_find_transform(task, obj, tfCls, pos, quat, NULL)) {
+                    if (objOut)
+                        *objOut = obj;
+                    found = true;
+                    break;
+                }
+            }
+
+            off += want;
+            budget = (budget > want) ? budget - want : 0;
+        }
+    }
+
+    free(buf);
+    return found;
+}
+
+/* Round 34/35: object header test for the Camera resolver. A strict klass
+   match is Camera; a different class object whose metadata name is "Camera"
+   also counts (the runtime can hand out more than one class object). */
+static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
+                        uint64_t meta, uint64_t nameOff)
+{
+    if (obj < HUNT_PTR_MIN)
+        return 0;
+
+    uint64_t k = rd64(task, obj);
+    if (!k)
+        return 0;
+    if (k == cls)
+        return 1;
+
+    char nm[40];
+    if (class_name_at(task, k, nameOff, meta, nm, sizeof(nm)) &&
+        diag_streq(nm, "Camera"))
+        return 2;
+
+    return 0;
+}
+
 /* ---------------- TRS transform-chain hunt ------------------------------ */
 
 /* Round 34: UnityEngine.Camera::main. The practice-mode camera is not the
@@ -2763,8 +2851,9 @@ stopped:
    Camera class -> static-fields block -> instance whose object header is the
    Camera class -> native object -> TRS slot -> forward from the quaternion.
    kind: 3 = static main field, 4 = Camera[] element (get_main/allCameras),
-   5 = fallback instance found in the same statics block. */
+   5 = fallback instance found in the statics block or on the heap. */
 - (BOOL)resolveMainCameraPos:(float *)posOut fwd:(float *)fwdOut kind:(int *)kindOut
+                    regions:(const planet_region *)regs count:(int)count
 {
     mach_port_t task = _task;
 
@@ -2786,18 +2875,21 @@ stopped:
     int nLoose = 0;
     uint64_t sfSeen = 0;
 
-    for (uint64_t off = 0x40; off <= 0x140; off += 8) {
+    /* Round 35: the static-fields pointer is not where the old window looked.
+       Scan the whole Il2CppClass object instead of 0x40..0x140, and treat any
+       readable block with a Camera object inside it as a statics candidate. */
+    for (uint64_t off = 0x00; off <= 0x400; off += 8) {
         uint64_t sf = rd64(task, cls + off);
-        if (sf < HUNT_PTR_MIN)
+        if (sf < HUNT_PTR_MIN || sf > 0x0000ffffffffffffULL)
             continue;
 
-        uint8_t blk[0x400];
+        uint8_t blk[0x800];
         memset(blk, 0, sizeof(blk));
         size_t got = hunt_read_obj(task, sf, blk, sizeof(blk));
         if (got < 8)
             continue;
 
-        sfSeen = sf;
+        bool used = false;
 
         for (size_t i = 0; i + 8 <= got; i += 8) {
             uint64_t v = 0;
@@ -2805,9 +2897,10 @@ stopped:
             if (v < HUNT_PTR_MIN)
                 continue;
 
-            if (rd64(task, v) == cls) {
+            if (cam_obj_kind(task, v, cls, _metaBase, _nameOff)) {
                 if (!direct)
                     direct = v;
+                used = true;
                 continue;
             }
 
@@ -2815,15 +2908,19 @@ stopped:
                0x20 (0x18 on the older layout). Test both element starts. */
             for (uint64_t eo = 0x18; eo <= 0x20; eo += 8) {
                 uint64_t e0 = rd64(task, v + eo);
-                if (e0 >= HUNT_PTR_MIN && rd64(task, e0) == cls) {
+                if (cam_obj_kind(task, e0, cls, _metaBase, _nameOff)) {
                     if (!elem)
                         elem = e0;
+                    used = true;
                 }
             }
 
             if (nLoose < 8)
                 loose[nLoose++] = v;
         }
+
+        if (used && !sfSeen)
+            sfSeen = sf;
     }
 
     [self vlogLine:@"cam: class=0x%llx statics=0x%llx direct=0x%llx elem=0x%llx",
@@ -2859,6 +2956,28 @@ stopped:
                     p[0], p[1], p[2], q[0], q[1], q[2], q[3],
                     f[0], f[1], f[2]];
         return YES;
+    }
+
+    /* Round 35: last resort - walk the same heap regions the TRS pass reads and
+       accept the first object whose header is the Camera class and whose native
+       side yields a real TRS. One match is enough, so the scan stops early. */
+    if (regs && count > 0) {
+        float p[3], q[4], f[3];
+        uint64_t obj = 0;
+
+        if (cam_heap_scan(task, regs, count, cls, tfCls, p, q, &obj)) {
+            if (cam_fwd_from_quat(q, f) && !(p[0] == 0.0f && p[2] == 0.0f)) {
+                memcpy(posOut, p, sizeof(p));
+                memcpy(fwdOut, f, sizeof(f));
+                if (kindOut)
+                    *kindOut = 5;
+
+                [self vlogLine:@"cam: inst=0x%llx kind=5 P=(%.3f,%.3f,%.3f) Q=(%.3f,%.3f,%.3f,%.3f) F=(%.3f,%.3f,%.3f)",
+                            obj, p[0], p[1], p[2], q[0], q[1], q[2], q[3],
+                            f[0], f[1], f[2]];
+                return YES;
+            }
+        }
     }
 
     [self vlogLine:@"cam: main unresolved (tried=%d direct=0x%llx elem=0x%llx)",
@@ -3118,7 +3237,8 @@ stopped:
 
     if (!haveCamP) {
         int kind = 0;
-        if ([self resolveMainCameraPos:camClassP fwd:camClassF kind:&kind]) {
+        if ([self resolveMainCameraPos:camClassP fwd:camClassF kind:&kind
+                               regions:regs count:count]) {
             camP = camClassP;
             camF = camClassF;
             haveCamP = true;
