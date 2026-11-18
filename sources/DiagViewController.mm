@@ -3285,7 +3285,7 @@ stopped:
             size_t got = hunt_read_obj(task, base, w, PLANET_WIN);
             [self vlogLine:@"MOVE AFTER 0x%llx base=0x%llx readable=0x%zx",
                         (unsigned long long)addr, (unsigned long long)base, got];
-            [self viewDumpRows:w have:got label:@"MAFTER"];
+            [self viewDumpRows:w have:got label:"MAFTER"];
             free(w);
         }
         [_moverWatch removeAllObjects];
