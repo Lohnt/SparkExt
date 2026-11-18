@@ -3003,6 +3003,7 @@ stopped:
 
     NSDictionary *prev = _actorSlots ?: [NSDictionary dictionary];
     NSMutableDictionary *next = [NSMutableDictionary dictionaryWithCapacity:8192];
+    NSMutableArray *nextBases = [NSMutableArray arrayWithCapacity:512];
 
     int changedActors = 0;
     int changedSlots = 0;
@@ -3022,6 +3023,11 @@ stopped:
         size_t have = hunt_read_obj(task, v, raw, sizeof(raw));
         int nslots = (int)(have / 4);
         scanned++;
+
+        /* Round 43: keep the distinct actor bases for the ESP stage. The class
+           pointer was already validated by scan_candidates. */
+        if (nextBases.count < 4096)
+            [nextBases addObject:@(v)];
 
         int inRun = 0;
         for (int j = 0; j < count; j++) {
@@ -3098,8 +3104,10 @@ stopped:
         }
     }
 
-    if (!stopped)
+    if (!stopped) {
         _actorSlots = next;
+        _actorBases = nextBases;
+    }
 
     [self logLine:@"census: %d actors / %d changed / %d changed slots / %d stride-0x58 members",
                scanned, changedActors, changedSlots, runMembers];
@@ -3388,6 +3396,287 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
     return NO;
 }
 
+/* Round 43: find a small-integer actor field that splits the actor set into
+   teams. Team ids are 0/1/2 in every shipped build; a boolean or a health
+   value does not satisfy "local value shared with at least one actor and
+   different for at least one other, at most four distinct values". Returns
+   -1 when no field qualifies, in which case the caller falls back to a
+   distance-based friend rule. */
+- (int)teamOffsetForActors:(const uint64_t *)vs count:(int)n
+                    localV:(uint64_t)localV local:(int *)teamOut
+{
+    int firstOff = -1, firstVal = -1, firstSame = 0, firstDiff = 0;
+    int bestOff = -1, bestVal = -1, bestSame = 0, bestDiff = 0;
+
+    if (!_actorSlots || !localV || n < 2)
+        return -1;
+
+    for (int off = 0x18; off <= 0x144; off += 4) {
+        NSNumber *ln = _actorSlots[[NSNumber numberWithUnsignedLongLong:
+                                    localV + (uint64_t)off]];
+        if (!ln)
+            continue;
+
+        uint32_t lv = [ln unsignedIntValue];
+        if (lv > 15)
+            continue;
+
+        int same = 0, diff = 0, nd = 0;
+        uint8_t seen[16];
+        memset(seen, 0, sizeof(seen));
+
+        for (int i = 0; i < n; i++) {
+            if (vs[i] == localV)
+                continue;
+
+            NSNumber *num = _actorSlots[[NSNumber numberWithUnsignedLongLong:
+                                         vs[i] + (uint64_t)off]];
+            if (!num)
+                continue;
+
+            uint32_t v = [num unsignedIntValue];
+            if (v < 16)
+                seen[v] = 1;
+            if (v == lv)
+                same++;
+            else
+                diff++;
+        }
+
+        for (int i = 0; i < 16; i++)
+            if (seen[i])
+                nd++;
+
+        if (same < 1 || diff < 1 || nd < 2 || nd > 4)
+            continue;
+
+        if (firstOff < 0) {
+            firstOff = off;
+            firstVal = (int)lv;
+            firstSame = same;
+            firstDiff = diff;
+        }
+
+        if (lv <= 2) {
+            bestOff = off;
+            bestVal = (int)lv;
+            bestSame = same;
+            bestDiff = diff;
+            break;
+        }
+    }
+
+    if (bestOff < 0) {
+        bestOff = firstOff;
+        bestVal = firstVal;
+        bestSame = firstSame;
+        bestDiff = firstDiff;
+    }
+
+    if (bestOff >= 0) {
+        *teamOut = bestVal;
+        [self vlogLine:@"team: off=0x%x local=%d same=%d diff=%d actors=%d",
+                    bestOff, bestVal, bestSame, bestDiff, n];
+    }
+
+    return bestOff;
+}
+
+/* Round 43: stage every live actor's view-state position. This is the root the
+   bind-pose skeletons cannot provide (their chain is local space), and it is
+   also where the team field is read. The eye position is dropped by 1.6 m so
+   the ESP box stands on the feet. */
+- (void)stageActorRootsTask:(mach_port_t)task haveCam:(BOOL)haveCam
+                       camP:(const float *)camP
+{
+    _actorRootN = 0;
+
+    if (!_actorBases || _actorBases.count == 0)
+        return;
+
+    uint64_t vs[256];
+    float ps[256 * 3];
+    uint8_t eye[256];
+    int n = 0;
+    int scanned = 0;
+    int fallbackProbes = 0;
+
+    for (NSNumber *bn in _actorBases) {
+        if (n >= 256 || scanned >= 4000 || gStopRequested.load())
+            break;
+        scanned++;
+
+        uint64_t v = [bn unsignedLongLongValue];
+        uint64_t t = rd64(task, v + VIEW_OFF_FIELD);
+        float p[4];
+        bool haveP = false;
+        bool fromView = false;
+
+        memset(p, 0, sizeof(p));
+
+        if (t >= HUNT_PTR_MIN && mr_read(task, t + 0x120, p, sizeof(p))) {
+            if (isfinite(p[0]) && isfinite(p[1]) && isfinite(p[2]) &&
+                fabsf(p[0]) <= 3000.0f && fabsf(p[2]) <= 3000.0f &&
+                p[1] >= -5.0f && p[1] <= 15.0f &&
+                !(p[0] == 0.0f && p[2] == 0.0f)) {
+                haveP = true;
+                fromView = true;
+            }
+        }
+
+        /* A remote actor may not publish a view state. Its component cluster
+           still holds a Transform; probe it, but cap the work. The resulting
+           row is a root position, not an eye, so no height adjustment. */
+        if (!haveP && fallbackProbes < 64) {
+            fallbackProbes++;
+            float hp[3];
+
+            if (human_probe_ptr(task, v, hp, NULL)) {
+                p[0] = hp[0];
+                p[1] = hp[1];
+                p[2] = hp[2];
+                p[3] = 0.0f;
+                if (fabsf(p[0]) <= 3000.0f && fabsf(p[2]) <= 3000.0f &&
+                    p[1] >= -5.0f && p[1] <= 15.0f &&
+                    !(p[0] == 0.0f && p[2] == 0.0f))
+                    haveP = true;
+            }
+        }
+
+        if (!haveP)
+            continue;
+
+        int dup = 0;
+        for (int i = 0; i < n; i++) {
+            float dx = p[0] - ps[i * 3 + 0];
+            float dy = p[1] - ps[i * 3 + 1];
+            float dz = p[2] - ps[i * 3 + 2];
+            if (dx * dx + dy * dy + dz * dz < 1.0f) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+
+        vs[n] = v;
+        ps[n * 3 + 0] = p[0];
+        ps[n * 3 + 1] = p[1];
+        ps[n * 3 + 2] = p[2];
+        eye[n] = fromView ? 1 : 0;
+        n++;
+    }
+
+    uint64_t localV = _localV;
+
+    if (!localV && haveCam && n > 0) {
+        float best = 1.0e9f;
+        for (int i = 0; i < n; i++) {
+            float dx = ps[i * 3 + 0] - camP[0];
+            float dy = ps[i * 3 + 1] - camP[1];
+            float dz = ps[i * 3 + 2] - camP[2];
+            float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d < best) {
+                best = d;
+                localV = vs[i];
+            }
+        }
+    }
+
+    int localTeam = 0;
+    int teamOff = [self teamOffsetForActors:vs count:n localV:localV
+                                      local:&localTeam];
+
+    if (teamOff >= 0) {
+        int shown = 0;
+
+        for (int i = 0; i < n && shown < 6; i++) {
+            NSNumber *num = _actorSlots[[NSNumber numberWithUnsignedLongLong:
+                                         vs[i] + (uint64_t)teamOff]];
+            if (!num)
+                continue;
+            shown++;
+            [self vlogLine:@"team: sample V=0x%llx val=%d%s",
+                        (unsigned long long)vs[i], (int)[num unsignedIntValue],
+                        (vs[i] == localV) ? " LOCAL" : ""];
+        }
+    }
+
+    int staged = 0;
+    int friends = 0;
+    int logged = 0;
+
+    for (int i = 0; i < n; i++) {
+        uint64_t v = vs[i];
+        if (v == localV)
+            continue;   /* the local player's own eye */
+
+        float px = ps[i * 3 + 0];
+        float py = ps[i * 3 + 1];
+        float pz = ps[i * 3 + 2];
+        float dist = -1.0f;
+
+        if (haveCam) {
+            float dx = px - camP[0];
+            float dy = py - camP[1];
+            float dz = pz - camP[2];
+            dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        }
+
+        int isFriend = 0;
+
+        if (teamOff >= 0) {
+            NSNumber *num = _actorSlots[[NSNumber numberWithUnsignedLongLong:
+                                         v + (uint64_t)teamOff]];
+            int val = num ? (int)[num unsignedIntValue] : -1;
+            isFriend = (val == localTeam);
+        } else if (dist >= 0.0f) {
+            isFriend = (dist < 4.0f);   /* fallback: close actor is a teammate */
+        }
+
+        float rootY = py - (eye[i] ? 1.6f : 0.0f);
+
+        if (_actorRootN < ESP_MAX_BOXES) {
+            _actorRootP[_actorRootN * 3 + 0] = px;
+            _actorRootP[_actorRootN * 3 + 1] = rootY;
+            _actorRootP[_actorRootN * 3 + 2] = pz;
+            _actorRootV[_actorRootN] = v;
+            _actorRootTeam[_actorRootN] = isFriend ? 1 : 0;
+            _actorRootN++;
+        }
+
+        if (dist > 30.0f) {
+            if (logged < 12) {
+                logged++;
+                [self vlogLine:@"human: actor V=0x%llx team=%s culled=1 dist=%.1f",
+                            (unsigned long long)v,
+                            isFriend ? "FRIEND" : "ENEMY", dist];
+            }
+            continue;
+        }
+
+        if (isFriend) {
+            friends++;
+        } else if (_espMode && _espStageN < ESP_MAX_BOXES) {
+            _espStageRoots[_espStageN * 3 + 0] = px;
+            _espStageRoots[_espStageN * 3 + 1] = rootY;
+            _espStageRoots[_espStageN * 3 + 2] = pz;
+            _espStageN++;
+            staged++;
+        }
+
+        if (logged < 12) {
+            logged++;
+            [self vlogLine:@"esp: actor V=0x%llx P=(%.2f,%.2f,%.2f) root=(%.2f,%.2f,%.2f) team=%s dist=%.1f staged=%d",
+                        (unsigned long long)v, px, py, pz, px, rootY, pz,
+                        isFriend ? "FRIEND" : "ENEMY", dist, staged];
+        }
+    }
+
+    [self vlogLine:@"esp: actors valid=%d staged=%d friends=%d teamOff=0x%x localV=0x%llx",
+                n, staged, friends, teamOff, (unsigned long long)localV];
+}
+
 /* Independent of the changed blocks: walks the same region list PLANETARY A
    built and tests every absolute 0x30-aligned block for a Unity transform -
    position at +0x00, unit quaternion at +0x10, uniform scale triple at +0x20.
@@ -3671,12 +3960,21 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
         }
     }
 
-    if (_espMode)
+    if (_espMode) {
         [self espStageCamera:camP haveP:haveCamP f:camF haveF:haveCamF];
+
+        /* Round 43: actor view-state roots come first. They cover bind-pose
+           skeletons and carry the team field; the skeleton loop below only
+           stages when no actor was resolvable. */
+        [self stageActorRootsTask:task haveCam:haveCamP camP:camP];
+    } else {
+        _actorRootN = 0;
+    }
 
     if (arrs) {
         uint64_t usedRoots[ESP_MAX_BOXES];
         int nUsedRoots = 0;
+        int actorCover = (_actorRootN > 0);
 
         for (int i = 0; i < narr; i++) {
             if (gStopRequested.load())
@@ -3759,12 +4057,61 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                         rootsrc = "slot";
                         rootAddr = src;
                     } else {
-                        humanBind++;
-                        roottag = " root=BIND";
-                        [self vlogLine:@"human: bind miss base=0x%llx slots=%d used=%d cam=%d",
-                                    (unsigned long long)arrs[i].base,
-                                    arrs[i].count, nUsedRoots,
-                                    haveCamP ? 1 : 0];
+                        /* Round 43: the actor stage already resolved every
+                           live player's world position. The skeleton array
+                           lives in the same component cluster, so the nearest
+                           unused actor base is its owner; use that actor's
+                           eye root instead of guessing a memory neighbour. */
+                        uint64_t bestV = 0;
+                        uint64_t bestD = ~0ULL;
+                        int bi = -1;
+
+                        for (int k = 0; k < _actorRootN; k++) {
+                            uint64_t a = _actorRootV[k];
+                            bool used = false;
+
+                            for (int u = 0; u < nUsedRoots; u++) {
+                                if (usedRoots[u] == a) {
+                                    used = true;
+                                    break;
+                                }
+                            }
+                            if (used)
+                                continue;
+
+                            uint64_t d = (a > arrs[i].base)
+                                         ? (a - arrs[i].base)
+                                         : (arrs[i].base - a);
+                            if (d < bestD) {
+                                bestD = d;
+                                bestV = a;
+                                bi = k;
+                            }
+                        }
+
+                        if (bi >= 0) {
+                            drawable = YES;
+                            roottag = " root=owner";
+                            rootsrc = "owner";
+                            rootAddr = bestV;
+                            dist = bestD;
+                            pre[0] = _actorRootP[bi * 3 + 0];
+                            pre[1] = _actorRootP[bi * 3 + 1];
+                            pre[2] = _actorRootP[bi * 3 + 2];
+
+                            [self vlogLine:@"human: owner actor=0x%llx d=0x%llx team=%s base=0x%llx",
+                                        (unsigned long long)bestV,
+                                        (unsigned long long)bestD,
+                                        _actorRootTeam[bi] ? "FRIEND" : "ENEMY",
+                                        (unsigned long long)arrs[i].base];
+                        } else {
+                            humanBind++;
+                            roottag = " root=BIND";
+                            [self vlogLine:@"human: bind miss base=0x%llx slots=%d used=%d cam=%d actors=%d",
+                                        (unsigned long long)arrs[i].base,
+                                        arrs[i].count, nUsedRoots,
+                                        haveCamP ? 1 : 0, _actorRootN];
+                        }
                     }
                 }
 
@@ -3785,9 +4132,24 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
 
             humanHits++;
 
-            /* Round 42: the ESP only draws actors within 50 m. Without this
-               the scan staged every map prop and the overlay filled with
-               boxes for enemies the user could not see. */
+            /* Round 43: label the skeleton with the team of the actor whose
+               eye root sits on it (3 m tolerance). */
+            const char *teamtag = "?";
+
+            if (drawable && _actorRootN > 0) {
+                for (int k = 0; k < _actorRootN; k++) {
+                    float dx = rootP[0] - _actorRootP[k * 3 + 0];
+                    float dy = rootP[1] - _actorRootP[k * 3 + 1];
+                    float dz = rootP[2] - _actorRootP[k * 3 + 2];
+
+                    if (dx * dx + dy * dy + dz * dz <= 9.0f) {
+                        teamtag = _actorRootTeam[k] ? "FRIEND" : "ENEMY";
+                        break;
+                    }
+                }
+            }
+
+            /* Round 43: 30 m cull until team filtering is proven. */
             float camDist = -1.0f;
             BOOL culled = NO;
             char culltag[48];
@@ -3800,7 +4162,7 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                 float dz = rootP[2] - camP[2];
 
                 camDist = sqrtf(dx * dx + dy * dy + dz * dz);
-                if (camDist > 50.0f) {
+                if (camDist > 30.0f) {
                     culled = YES;
                     humanCull++;
                     snprintf(culltag, sizeof(culltag), " culled=1 dist=%.1f",
@@ -3808,12 +4170,13 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                 }
             }
 
-            [self vlogLine:@"human: root=0x%llx bind=%d src=%s slots=%d dist=0x%llx P=(%.3f,%.3f,%.3f)%s",
+            [self vlogLine:@"human: root=0x%llx bind=%d src=%s slots=%d team=%s dist=0x%llx P=(%.3f,%.3f,%.3f)%s",
                         rootAddr, bind ? 1 : 0, rootsrc, arrs[i].count,
-                        (unsigned long long)dist,
+                        teamtag, (unsigned long long)dist,
                         rootP[0], rootP[1], rootP[2], culltag];
 
-            if (drawable && !culled && _espMode && _espStageN < ESP_MAX_BOXES) {
+            if (drawable && !culled && !actorCover && _espMode &&
+                _espStageN < ESP_MAX_BOXES) {
                 _espStageRoots[_espStageN * 3 + 0] = rootP[0];
                 _espStageRoots[_espStageN * 3 + 1] = rootP[1];
                 _espStageRoots[_espStageN * 3 + 2] = rootP[2];

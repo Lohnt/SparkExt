@@ -57,6 +57,14 @@ typedef struct {
     NSMutableDictionary *_tableSlots;
     int _scanCount;
 
+    /* Round 43: distinct K1779 actor instance bases seen by the census, and the
+       actor view-state roots staged for ESP (eye position -> feet, team). */
+    NSMutableArray *_actorBases;
+    float _actorRootP[ESP_MAX_BOXES * 3];
+    uint64_t _actorRootV[ESP_MAX_BOXES];
+    int _actorRootTeam[ESP_MAX_BOXES];   /* 1 friend, 0 enemy */
+    int _actorRootN;
+
     /* Round 24: the planetary hash snapshot, kept across scans (ring of one). */
     planet_region *_planetRegs;
     int _planetNRegs;

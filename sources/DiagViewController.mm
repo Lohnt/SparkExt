@@ -45,6 +45,8 @@ static bool diag_sleep_checked(double seconds)
     _actorSlots = [NSMutableDictionary dictionary];
     _tableSlots = [NSMutableDictionary dictionary];
     _scanCount = 0;
+    _actorBases = [NSMutableArray array];
+    _actorRootN = 0;
     _planetRegs = NULL;
     _planetNRegs = 0;
     _moverHist = [NSMutableDictionary dictionary];
