@@ -67,10 +67,13 @@
 #define PLANET_CHANGED_MAX  (2u * 1024u * 1024u)
 #define PLANET_WIN          0x60
 #define PLANET_WIN_BACK     0x20
-#define PLANET_SCREEN_ENT   60
 #define PLANET_SCREEN_CLU   40
+#define PLANET_SCREEN_MOVED 40
 #define PLANET_CLUSTER_GAP  0x1000ULL
 #define PLANET_HASH_CHUNK   (1u << 20)
+#define PLANET_SELF_WIN     0x200
+#define PLANET_SELF_RADIUS  3.0f
+#define PLANET_MOVER_MAX    200000
 
 /* --- il2cpp class metadata ---------------------------------------------- */
 #define ACTOR_NAME_EXPECT  "O7D1D7DB39"
@@ -673,6 +676,93 @@ static bool planet_pos_ok(const float *f)
     return true;
 }
 
+/* True when v is not within 0.0005 of an integer. Two of the three position
+   components have to be fractional for a real entity record. */
+static bool planet_frac(float v)
+{
+    return fabsf(v - roundf(v)) > 0.0005f;
+}
+
+/* Tightened position test. The loose planet_pos_ok also matches grid-quantised
+   map geometry and (1,1,1) matrix pools, so entity positions additionally need
+   an eye-height y and at least two fractional components. */
+static bool planet_entity_pos_ok(const float *f)
+{
+    if (!planet_pos_ok(f))
+        return false;
+
+    if (f[1] < 0.3f || f[1] > 30.0f)
+        return false;
+
+    int frac = 0;
+    for (int i = 0; i < 3; i++) {
+        if (planet_frac(f[i]))
+            frac++;
+    }
+    if (frac < 2)
+        return false;
+
+    if (f[0] == f[1] && f[1] == f[2])
+        return false;
+
+    return true;
+}
+
+/* A direction is usable only if it is unit length and not one of the axis
+   vectors (|d| >= 0.995 with the other two components <= 0.005). */
+static bool planet_entity_dir_ok(const float *f)
+{
+    if (!view_dir_ok(f, NULL))
+        return false;
+
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(f[i]) < 0.995f)
+            continue;
+        int j = (i + 1) % 3;
+        int k = (i + 2) % 3;
+        if (fabsf(f[j]) <= 0.005f && fabsf(f[k]) <= 0.005f)
+            return false;
+    }
+    return true;
+}
+
+/* Mirrored records differ only in the sign of the direction. Canonicalising
+   the sign makes (pos, dir) and (pos, -dir) collide so the first is kept. */
+static void planet_canon_dir(const float *d, float *out)
+{
+    int first = 0;
+
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(d[i]) > 0.005f) {
+            first = i;
+            break;
+        }
+    }
+
+    float sign = (d[first] < 0.0f) ? -1.0f : 1.0f;
+    for (int i = 0; i < 3; i++)
+        out[i] = d[i] * sign;
+}
+
+/* One moved entity: address of the position triple and the last two values. */
+typedef struct {
+    uint64_t addr;
+    float d;
+    float ox, oy, oz;
+    float nx, ny, nz;
+} mover_rec;
+
+static int mover_cmp_desc(const void *a, const void *b)
+{
+    const mover_rec *ma = (const mover_rec *)a;
+    const mover_rec *mb = (const mover_rec *)b;
+    if (ma->d > mb->d)
+        return -1;
+    if (ma->d < mb->d)
+        return 1;
+    return 0;
+}
+
 /* 16-bit fingerprint of one 0x20 block: XOR-fold its eight u32 words. */
 static uint16_t planet_hash_block(const uint8_t *p)
 {
@@ -1116,6 +1206,11 @@ stopped:
     /* Round 24: the planetary hash snapshot, kept across scans (ring of one). */
     planet_region *_planetRegs;
     int _planetNRegs;
+
+    /* Round 25: last scan's position per position-address (mover tracking) and
+       the insertion order used to keep that history at 200k addresses. */
+    NSMutableDictionary *_moverHist;
+    NSMutableArray *_moverOrder;
 }
 
 - (void)appendLog:(NSString *)line;
@@ -1183,6 +1278,8 @@ stopped:
     _scanCount = 0;
     _planetRegs = NULL;
     _planetNRegs = 0;
+    _moverHist = [NSMutableDictionary dictionary];
+    _moverOrder = [NSMutableArray array];
 
     self.view.backgroundColor = [UIColor blackColor];
 
@@ -2581,8 +2678,10 @@ stopped:
    previous scan left behind - region for region, skipping any region whose
    base/size no longer matches - and collects the changed block addresses.
    The hash arrays are then reused in place, so exactly one snapshot is ever
-   live (ring of one). Changed blocks are re-read as 0x60 windows and scored for
-   the position+unit-vector pair that identifies a live entity. */
+   live (ring of one). Changed blocks are re-read as 0x60 windows, filtered for
+   a real entity record (eye-height fractional position + non-axis unit dir,
+   mirrored twins collapsed), matched against the local camera for SELF, and
+   compared with the previous scan's position for MOVER. */
 - (void)runPlanetaryTask:(mach_port_t)task
 {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
@@ -2794,15 +2893,45 @@ stopped:
     free(chunk);
 
     /* ---------------- entity extraction over changed blocks ------------ */
+
+    /* SELF anchor: the local camera position, read fresh from the config
+       actor's view state (T+0x120). */
+    uint64_t selfT = _localV ? rd64(task, _localV + VIEW_OFF_FIELD) : 0;
+    float selfP[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    bool haveSelfP = false;
+
+    if (selfT && mr_read(task, selfT + 0x120, selfP, sizeof(selfP))) {
+        if (isfinite(selfP[0]) && isfinite(selfP[1]) && isfinite(selfP[2]) &&
+            fabsf(selfP[0]) <= 3000.0f && fabsf(selfP[2]) <= 3000.0f &&
+            fabsf(selfP[1]) <= 500.0f &&
+            !(selfP[0] == 0.0f && selfP[1] == 0.0f && selfP[2] == 0.0f))
+            haveSelfP = true;
+    }
+
+    [self vlogLine:@"planetary: self V=0x%llx T=0x%llx P=(%.3f,%.3f,%.3f) %s",
+                (unsigned long long)_localV, (unsigned long long)selfT,
+                selfP[0], selfP[1], selfP[2],
+                haveSelfP ? "valid" : "unavailable"];
+
     int entities = 0;
+    int selfHits = 0;
     int clusters = 0;
-    int entScreen = 0;
     uint64_t *entAddrs = NULL;
     int entN = 0;
 
+    /* Value-based dedupe: the same record reached from neighbouring changed
+       blocks, and the mirrored (pos, -dir) twin, collapse to one key. */
+    NSMutableSet *seen = [NSMutableSet setWithCapacity:1024];
+
+    /* Mover bookkeeping. Only candidates seen in the previous scan can move. */
+    mover_rec *movedList = NULL;
+    int movedN = 0;
+    int movedCap = 0;
+    int staticCount = 0;
+    int tracked = 0;
+
     if (chgStored > 0) {
         entAddrs = (uint64_t *)malloc((size_t)chgStored * sizeof(uint64_t));
-        NSMutableSet *seen = [NSMutableSet setWithCapacity:1024];
         uint8_t win[PLANET_WIN];
 
         for (uint32_t i = 0; i < chgStored; i++) {
@@ -2825,7 +2954,7 @@ stopped:
 
             int posOff = -1;
             for (int o = 0; o + 3 <= nf; o++) {
-                if (planet_pos_ok(f + o)) {
+                if (planet_entity_pos_ok(f + o)) {
                     posOff = o;
                     break;
                 }
@@ -2837,7 +2966,7 @@ stopped:
             for (int o = 0; o + 3 <= nf; o++) {
                 if (o >= posOff - 8 && o <= posOff + 8)
                     continue;
-                if (view_dir_ok(f + o, NULL)) {
+                if (planet_entity_dir_ok(f + o)) {
                     dirOff = o;
                     break;
                 }
@@ -2845,12 +2974,20 @@ stopped:
             if (dirOff < 0)
                 continue;
 
-            /* Adjacent changed blocks find the same triple; dedupe on the
-               absolute position address. */
-            uint64_t posAddr = wbase + (uint64_t)posOff * 4;
-            NSNumber *key = [NSNumber numberWithUnsignedLongLong:posAddr];
+            float px = f[posOff];
+            float py = f[posOff + 1];
+            float pz = f[posOff + 2];
+            float dx = f[dirOff];
+            float dy = f[dirOff + 1];
+            float dz = f[dirOff + 2];
 
-            if (seen.count < 200000) {
+            float canon[3];
+            planet_canon_dir(f + dirOff, canon);
+
+            if (seen.count < 300000) {
+                NSString *key = [NSString stringWithFormat:
+                                 @"%.2f/%.2f/%.2f/%.2f/%.2f/%.2f",
+                                 px, py, pz, canon[0], canon[1], canon[2]];
                 if ([seen containsObject:key])
                     continue;
                 [seen addObject:key];
@@ -2858,57 +2995,164 @@ stopped:
 
             entities++;
 
-            NSString *line = [NSString stringWithFormat:
-                              @"ENT 0x%llx pos=(%.3f,%.3f,%.3f) dir=(%.3f,%.3f,%.3f)",
-                              (unsigned long long)blockAddr,
-                              f[posOff], f[posOff + 1], f[posOff + 2],
-                              f[dirOff], f[dirOff + 1], f[dirOff + 2]];
+            uint64_t posAddr = wbase + (uint64_t)posOff * 4;
 
-            if (entScreen < PLANET_SCREEN_ENT) {
-                [self logLine:@"%@", line];
-                entScreen++;
-            } else {
-                [self vlogLine:@"%@", line];
-            }
-
+            [self vlogLine:@"ENT 0x%llx pos=(%.3f,%.3f,%.3f) dir=(%.3f,%.3f,%.3f) posAddr=0x%llx",
+                        (unsigned long long)blockAddr, px, py, pz, dx, dy, dz,
+                        (unsigned long long)posAddr];
             [self vlogLine:@"ENT WIN 0x%llx pos+0x%03x dir+0x%03x",
                         (unsigned long long)wbase, (unsigned)(posOff * 4),
                         (unsigned)(dirOff * 4)];
             [self viewDumpRows:win have:have label:"ENT"];
 
+            /* SELF: the candidate sitting on the local camera. Never truncated
+               - this is the player-table locator. */
+            if (haveSelfP) {
+                float sdx = px - selfP[0];
+                float sdy = py - selfP[1];
+                float sdz = pz - selfP[2];
+                float sd = sqrtf(sdx * sdx + sdy * sdy + sdz * sdz);
+
+                if (sd <= PLANET_SELF_RADIUS) {
+                    selfHits++;
+                    [self logLine:@"SELF 0x%llx pos=(%.3f,%.3f,%.3f) dir=(%.3f,%.3f,%.3f) d=%.2f",
+                               (unsigned long long)blockAddr, px, py, pz, dx, dy, dz, sd];
+
+                    uint64_t dumpBase = (blockAddr > 0x100) ? blockAddr - 0x100 : blockAddr;
+                    uint8_t *win2 = (uint8_t *)malloc(PLANET_SELF_WIN);
+
+                    if (win2) {
+                        memset(win2, 0, PLANET_SELF_WIN);
+                        size_t have2 = hunt_read_obj(task, dumpBase, win2, PLANET_SELF_WIN);
+                        [self vlogLine:@"SELF WIN 0x%llx readable=0x%zx (for 0x%llx)",
+                                    (unsigned long long)dumpBase, have2,
+                                    (unsigned long long)posAddr];
+                        [self viewDumpRows:win2 have:have2 label:"SELF"];
+                        free(win2);
+                    }
+                }
+            }
+
+            /* MOVER: compare this position address against last scan's value. */
+            NSNumber *pkey = [NSNumber numberWithUnsignedLongLong:posAddr];
+            NSData *oldData = _moverHist[pkey];
+
+            if (oldData && oldData.length == sizeof(float) * 3) {
+                float oldp[3];
+                memcpy(oldp, oldData.bytes, sizeof(oldp));
+                tracked++;
+
+                float mdx = px - oldp[0];
+                float mdy = py - oldp[1];
+                float mdz = pz - oldp[2];
+                float dist = sqrtf(mdx * mdx + mdy * mdy + mdz * mdz);
+
+                if (dist <= 0.001f) {
+                    staticCount++;
+                } else {
+                    if (movedN == movedCap) {
+                        int ncap = movedCap ? movedCap * 2 : 1024;
+                        mover_rec *grown = (mover_rec *)realloc(
+                            movedList, (size_t)ncap * sizeof(mover_rec));
+                        if (grown) {
+                            movedList = grown;
+                            movedCap = ncap;
+                        }
+                    }
+                    if (movedN < movedCap) {
+                        mover_rec *mr = &movedList[movedN++];
+                        mr->addr = posAddr;
+                        mr->d = dist;
+                        mr->ox = oldp[0];
+                        mr->oy = oldp[1];
+                        mr->oz = oldp[2];
+                        mr->nx = px;
+                        mr->ny = py;
+                        mr->nz = pz;
+                    }
+                }
+            }
+
+            float cur[3] = { px, py, pz };
+            if (!oldData)
+                [_moverOrder addObject:pkey];
+            _moverHist[pkey] = [NSData dataWithBytes:cur length:sizeof(cur)];
+
             if (entAddrs && entN < (int)chgStored)
                 entAddrs[entN++] = blockAddr;
         }
+    }
 
-        /* An entity table shows up as one dense cluster: group candidates whose
-           addresses are within 0x1000 of the neighbour. */
-        if (entN > 1) {
-            qsort(entAddrs, (size_t)entN, sizeof(uint64_t), planet_cmp_u64);
+    /* Ring of PLANET_MOVER_MAX position addresses; evict in batches. */
+    if (_moverOrder.count > PLANET_MOVER_MAX) {
+        NSUInteger drop = _moverOrder.count - PLANET_MOVER_MAX;
+        if (drop < 8192)
+            drop = 8192;
+        if (drop > _moverOrder.count)
+            drop = _moverOrder.count;
 
-            int start = 0;
-            int cluScreen = 0;
+        for (NSUInteger k = 0; k < drop; k++)
+            [_moverHist removeObjectForKey:_moverOrder[k]];
+        [_moverOrder removeObjectsInRange:NSMakeRange(0, drop)];
+    }
 
-            for (int i = 1; i <= entN; i++) {
-                if (i < entN && entAddrs[i] - entAddrs[i - 1] <= PLANET_CLUSTER_GAP)
-                    continue;
+    if (!haveSelfP) {
+        [self logLine:@"SELF: no camera P (V=0x%llx T=0x%llx)",
+                   (unsigned long long)_localV, (unsigned long long)selfT];
+    } else if (selfHits == 0) {
+        [self logLine:@"SELF: 0 candidates within %.1f of (%.2f,%.2f,%.2f) (changed=%llu)",
+                   PLANET_SELF_RADIUS, selfP[0], selfP[1], selfP[2],
+                   (unsigned long long)changed];
+    }
 
-                clusters++;
+    [self logLine:@"MOVER: tracked=%d moved=%d static=%d (top %d by displacement)",
+               tracked, movedN, staticCount, PLANET_SCREEN_MOVED];
 
-                NSString *line = [NSString stringWithFormat:@"cluster base=0x%llx count=%d",
-                                  (unsigned long long)entAddrs[start], i - start];
-                if (cluScreen < PLANET_SCREEN_CLU) {
-                    [self logLine:@"%@", line];
-                    cluScreen++;
-                } else {
-                    [self vlogLine:@"%@", line];
-                }
-                start = i;
-            }
-        } else if (entN == 1) {
-            clusters = 1;
-            [self logLine:@"cluster base=0x%llx count=1",
-                       (unsigned long long)entAddrs[0]];
+    if (movedN > 0) {
+        qsort(movedList, (size_t)movedN, sizeof(mover_rec), mover_cmp_desc);
+
+        for (int i = 0; i < movedN; i++) {
+            mover_rec *mr = &movedList[i];
+            NSString *line = [NSString stringWithFormat:
+                              @"ENT 0x%llx moved d=%.2f (%.2f,%.2f,%.2f) -> (%.2f,%.2f,%.2f)",
+                              (unsigned long long)mr->addr, mr->d,
+                              mr->ox, mr->oy, mr->oz, mr->nx, mr->ny, mr->nz];
+            if (i < PLANET_SCREEN_MOVED)
+                [self logLine:@"%@", line];
+            else
+                [self vlogLine:@"%@", line];
         }
+    }
+
+    free(movedList);
+
+    /* Clusters are computed over the filtered candidates only. */
+    if (entN > 1) {
+        qsort(entAddrs, (size_t)entN, sizeof(uint64_t), planet_cmp_u64);
+
+        int start = 0;
+        int cluScreen = 0;
+
+        for (int i = 1; i <= entN; i++) {
+            if (i < entN && entAddrs[i] - entAddrs[i - 1] <= PLANET_CLUSTER_GAP)
+                continue;
+
+            clusters++;
+
+            NSString *line = [NSString stringWithFormat:@"cluster base=0x%llx count=%d",
+                              (unsigned long long)entAddrs[start], i - start];
+            if (cluScreen < PLANET_SCREEN_CLU) {
+                [self logLine:@"%@", line];
+                cluScreen++;
+            } else {
+                [self vlogLine:@"%@", line];
+            }
+            start = i;
+        }
+    } else if (entN == 1) {
+        clusters = 1;
+        [self logLine:@"cluster base=0x%llx count=1",
+                   (unsigned long long)entAddrs[0]];
     }
 
     [self logLine:@"PLANETARY B changed=%llu entities=%d clusters=%d",
