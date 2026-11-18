@@ -1006,34 +1006,45 @@ static bool human_world_pos_ok(const float *p)
 static bool human_probe_ptr(mach_port_t task, uint64_t c, float *out,
                             uint64_t *srcOut)
 {
+    /* Round 41: a managed Component reaches its native Transform through
+       m_CachedPtr, but the field offset varies with the class layout (0x8 for
+       some builds, 0x10 for others). Probe the object itself and every
+       pointer-sized field in the first 0x48 bytes. */
+    static const size_t kOff[8] = { 0x08, 0x10, 0x18, 0x20, 0x28, 0x30,
+                                    0x38, 0x40 };
     uint8_t buf[0x400];
-    float p[3], q[4];
+    float p[3];
 
     if (!out || c < HUNT_PTR_MIN)
         return false;
 
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass <= 8; pass++) {
         uint64_t addr = c;
 
-        if (pass == 1) {
-            addr = rd64(task, c + 0x10);
+        if (pass > 0) {
+            addr = rd64(task, c + kOff[pass - 1]);
             if (addr < HUNT_PTR_MIN)
-                break;
+                continue;
         }
 
         memset(buf, 0, sizeof(buf));
         size_t got = hunt_read_obj(task, addr, buf, sizeof(buf));
         if (got < 0x30)
             continue;
-        if (!cam_trs_probe(buf, got, p, q))
-            continue;
-        if (!human_world_pos_ok(p))
-            continue;
 
-        memcpy(out, p, sizeof(p));
-        if (srcOut)
-            *srcOut = addr;
-        return true;
+        /* The camera probe insists on |x|,|z| >= 1; a bot near a world axis
+           would fail it. Only the finiteness/scale checks matter here. */
+        for (size_t b = 0; b + 0x30 <= got; b += 0x10) {
+            if (!planet_trs_ok(buf + b, p))
+                continue;
+            if (!human_world_pos_ok(p))
+                continue;
+
+            memcpy(out, p, sizeof(p));
+            if (srcOut)
+                *srcOut = addr + (uint64_t)b;
+            return true;
+        }
     }
 
     return false;
@@ -1070,39 +1081,77 @@ static bool human_owner_root(mach_port_t task, uint64_t base, float *out,
             memcpy(&dbg->p[i], hw + (size_t)i * 8, sizeof(uint64_t));
     }
 
-    uint64_t cand[40];
-    int nc = 0;
+    /* Round 41: the skeleton array's header points at the owning GameObject,
+       but the world Transform is usually two hops away (GameObject ->
+       components -> Transform/m_CachedPtr). Walk that pointer graph breadth
+       first, testing every reachable block for a world-space TRS row. */
+    uint64_t queue[160];
+    int qn = 0;
+    int qh = 0;
 
-    for (size_t i = 0; i + 8 <= hh && nc < 12; i += 8) {
+    for (size_t i = 0; i + 8 <= hh && qn < 160; i += 8) {
         uint64_t v = 0;
         memcpy(&v, hw + i, sizeof(v));
         if (v >= HUNT_PTR_MIN && v <= 0x0000ffffffffffffULL)
-            cand[nc++] = v;
+            queue[qn++] = v;
     }
 
-    int lvl1 = nc;
-
-    for (int i = 0; i < lvl1 && nc < 40; i++) {
+    while (qh < qn && qh < 160) {
+        uint64_t node = queue[qh++];
         uint8_t blk[0x100];
         memset(blk, 0, sizeof(blk));
-        size_t got = hunt_read_obj(task, cand[i], blk, sizeof(blk));
-        for (size_t k = 0; k + 8 <= got && nc < 40; k += 8) {
+        size_t got = hunt_read_obj(task, node, blk, sizeof(blk));
+
+        if (got < 8)
+            continue;
+
+        if (dbg)
+            dbg->tested = qh;
+
+        /* A Transform block can sit at any 16-byte offset in this object. */
+        for (size_t b = 0; b + 0x30 <= got; b += 0x10) {
+            float pos[3];
+            float xz;
+
+            if (!planet_trs_ok(blk + b, pos))
+                continue;
+            if (!human_world_pos_ok(pos))
+                continue;
+
+            xz = sqrtf(pos[0] * pos[0] + pos[2] * pos[2]);
+            if (xz < 1.0f)
+                continue;
+
+            memcpy(out, pos, sizeof(pos));
+            if (srcOut)
+                *srcOut = node + (uint64_t)b;
+            if (dbg)
+                dbg->ncand = qn;
+            return true;
+        }
+
+        for (size_t k = 0; k + 8 <= got && qn < 160; k += 8) {
             uint64_t v = 0;
             memcpy(&v, blk + k, sizeof(v));
-            if (v >= HUNT_PTR_MIN && v <= 0x0000ffffffffffffULL)
-                cand[nc++] = v;
+            if (v < HUNT_PTR_MIN || v > 0x0000ffffffffffffULL)
+                continue;
+
+            bool seen = false;
+
+            for (int i = 0; i < qn; i++) {
+                if (queue[i] == v) {
+                    seen = true;
+                    break;
+                }
+            }
+
+            if (!seen)
+                queue[qn++] = v;
         }
     }
 
     if (dbg)
-        dbg->ncand = nc;
-
-    for (int i = 0; i < nc; i++) {
-        if (dbg)
-            dbg->tested = i + 1;
-        if (human_probe_ptr(task, cand[i], out, srcOut))
-            return true;
-    }
+        dbg->ncand = qn;
 
     return false;
 }
@@ -1216,16 +1265,19 @@ static bool human_near_trs(mach_port_t task, uint64_t base, int rows,
     return hit;
 }
 
-/* Round 39: last resort pairing. Same filters as the near scan, but over every
-   TRS slot the pass collected within 256 KB: near-origin rows, the camera row
-   and roots already claimed by another skeleton are rejected. */
+/* Round 41: last resort pairing. Same filters as the near scan, but over every
+   TRS slot the pass collected. The address window is 16 MB because a bind
+   skeleton's live root Transform can sit far from the cached model array;
+   address-nearest still prefers the actor's own component cluster. Near-origin
+   rows, the camera row and roots already claimed by another skeleton are
+   rejected. */
 static bool human_nearest_slot(const trs_slot *slots, int nslots, uint64_t base,
                                int rows, const float *camP,
                                const uint64_t *used, int usedN,
                                float *out, uint64_t *srcOut,
                                uint64_t *distOut)
 {
-    const uint64_t maxDist = 0x40000ULL;   /* 256 KB */
+    const uint64_t maxDist = 0x1000000ULL;   /* 16 MB */
 
     if (!slots || nslots <= 0 || !out)
         return false;
@@ -3674,6 +3726,9 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                     roottag = " root=owner";
                     rootsrc = "owner";
                     rootAddr = src;
+                    [self vlogLine:@"human: owner hit src=0x%llx nodes=%d base=0x%llx",
+                                src, od.tested,
+                                (unsigned long long)arrs[i].base];
                 } else {
                     [self vlogLine:@"human: owner hdr=0x%llx p=0x%llx,0x%llx,0x%llx,0x%llx cands=%d tested=%d base=0x%llx",
                                 od.hdr, od.p[0], od.p[1], od.p[2], od.p[3],
@@ -3700,6 +3755,10 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                     } else {
                         humanBind++;
                         roottag = " root=BIND";
+                        [self vlogLine:@"human: bind miss base=0x%llx slots=%d used=%d cam=%d",
+                                    (unsigned long long)arrs[i].base,
+                                    arrs[i].count, nUsedRoots,
+                                    haveCamP ? 1 : 0];
                     }
                 }
 
@@ -4123,9 +4182,12 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
             float qf[3];
 
             if (cam_fwd_from_quat(selfQ, qf)) {
-                selfF[0] = qf[0];
-                selfF[1] = qf[1];
-                selfF[2] = qf[2];
+                /* Round 41: this quaternion's optical axis is -z (the camera
+                   looks down its local -z), so q * (0,0,1) is the backward
+                   vector. Negate: forward = q * (0,0,-1). */
+                selfF[0] = -qf[0];
+                selfF[1] = -qf[1];
+                selfF[2] = -qf[2];
                 selfF[3] = 0.0f;
                 haveSelfQ = true;
             }
@@ -4133,8 +4195,9 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
     }
 
     if (haveSelfQ) {
-        [self vlogLine:@"cam: view quat=(%.3f,%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) src=T",
+        [self vlogLine:@"cam: q raw=(%.3f,%.3f,%.3f,%.3f) at T+0x130=0x%llx fwd=(%.3f,%.3f,%.3f) src=T",
                     selfQ[0], selfQ[1], selfQ[2], selfQ[3],
+                    (unsigned long long)(selfT + 0x130),
                     selfF[0], selfF[1], selfF[2]];
     }
 
@@ -4182,9 +4245,11 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
                 float qf[3];
 
                 if (cam_fwd_from_quat(f, qf)) {
-                    f[0] = qf[0];
-                    f[1] = qf[1];
-                    f[2] = qf[2];
+                    /* Round 41: same -z optical axis convention as the direct
+                       view-state read. */
+                    f[0] = -qf[0];
+                    f[1] = -qf[1];
+                    f[2] = -qf[2];
                     f[3] = 0.0f;
                 }
             }
