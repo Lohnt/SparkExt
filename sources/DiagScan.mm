@@ -92,7 +92,7 @@
 /* --- round 26: TRS transform chains, PERSIST, GHOST --------------------- */
 #define PLANET_TRS_STRIDE   0x30ULL
 #define PLANET_TRS_CHUNK    0x300000u
-#define PLANET_TRS_GAP      0x2000ULL
+#define PLANET_TRS_GAP      0x1000ULL
 #define PLANET_TRS_ARRAYS   40
 #define PLANET_TRS_POS      12
 #define PLANET_TRS_OUT_MAX  4000
