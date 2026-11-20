@@ -4199,13 +4199,12 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
 
     if (arrs && narr > 0) {
         int listed = 0;
+        int humanCand = 0;
+        int humanExact = 0;
+        int humanLoose = 0;
+        int humanMax = 0;
 
         for (int i = 0; i < narr; i++) {
-            if (listed > 0 && listed + arrs[i].count > PLANET_TRS_OUT_MAX)
-                break;
-            [self vlogLine:@"TRS array base=0x%llx count=%d",
-                        (unsigned long long)arrs[i].base, arrs[i].count];
-            listed += arrs[i].count;
         }
 
         if (listed < nslots)
@@ -4330,6 +4329,8 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
 
             humanCand++;
 
+            [self vlogLine:@"human: array %d has %d slots (need %d)", i, arrs[i].count, PLANET_HUMAN_MIN];
+
             /* slot0..slot8 as raw TRS rows: pos, quat, scale. The signature
                decides membership; the bind-pose test decides drawability. */
             uint8_t trs[PLANET_HUMAN_ROWS * 0x30];
@@ -4351,6 +4352,8 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
             if (sig < 0)
                 continue;
 
+            humanHits++;
+
             float rootP[3];
             float headP[3];
             memcpy(rootP, trs, sizeof(rootP));
@@ -4359,6 +4362,9 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
             if (!isfinite(rootP[0]) || !isfinite(rootP[1]) ||
                 !isfinite(rootP[2]) || !isfinite(headP[1]))
                 continue;
+
+            [self vlogLine:@"human: group head_y=%.2f sig=%d root=(%.2f,%.2f,%.2f)",
+                        headP[1], sig, rootP[0], rootP[1], rootP[2]];
 
             BOOL bind = (rootP[0] == 0.0f && rootP[1] == 0.0f &&
                          rootP[2] == 0.0f);
