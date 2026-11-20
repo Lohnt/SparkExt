@@ -371,6 +371,105 @@ static bool class_name_probe(mach_port_t task, uint64_t cls, uint64_t meta,
     return false;
 }
 
+/* Round 45: the definition-table slot for a type id is not stable across
+   builds/reattaches (13036 read back zero). Verify the slot by class name and,
+   when it is empty or wrong, scan the table for a class whose name matches.
+   The successful lookup is cached for the process lifetime. */
+static uint64_t tid_class_named(mach_port_t task, uint64_t tidBase, uint64_t td,
+                                uint64_t meta, uint64_t nameOff,
+                                const char *want, uint64_t *foundTd)
+{
+    static uint64_t cacheBase = 0;
+    static uint64_t cacheCls = 0;
+    static uint64_t cacheTd = 0;
+    static const char *cacheWant = NULL;
+    char nm[40];
+
+    if (foundTd)
+        *foundTd = td;
+
+    if (!tidBase || !want)
+        return 0;
+
+    if (cacheBase == tidBase && cacheCls && cacheWant && diag_streq(cacheWant, want)) {
+        if (foundTd)
+            *foundTd = cacheTd;
+        return cacheCls;
+    }
+
+    uint64_t cls = tid_class(task, tidBase, td);
+
+    if (cls >= HUNT_PTR_MIN && (cls & 0x7) == 0) {
+        nm[0] = '\0';
+        if (class_name_at(task, cls, nameOff, meta, nm, sizeof(nm)) &&
+            diag_streq(nm, want)) {
+            cacheBase = tidBase;
+            cacheCls = cls;
+            cacheTd = td;
+            cacheWant = want;
+            return cls;
+        }
+    }
+
+    for (uint64_t i = 1; i < 131072ULL; i++) {
+        if ((i & 0xFFF) == 0 && gStopRequested.load())
+            return 0;
+
+        cls = rd64(task, tidBase + i * 8);
+        if (cls < HUNT_PTR_MIN || (cls & 0x7) != 0)
+            continue;
+
+        nm[0] = '\0';
+        if (!class_name_at(task, cls, nameOff, meta, nm, sizeof(nm)))
+            continue;
+        if (!diag_streq(nm, want))
+            continue;
+
+        cacheBase = tidBase;
+        cacheCls = cls;
+        cacheTd = i;
+        cacheWant = want;
+        if (foundTd)
+            *foundTd = i;
+        return cls;
+    }
+
+    return 0;
+}
+
+/* Round 45: the definition table is read once by the bootstrap and again by the
+   scan. The second read could come back zero, which killed every class lookup
+   downstream (Transform null, field chains null, no arrays). A table is only
+   accepted when its 1779 slot still points at the actor class the bootstrap
+   found. */
+static bool tid_base_valid(mach_port_t task, uint64_t base, uint64_t k1779)
+{
+    if (base < HUNT_PTR_MIN || (base & 0x7) != 0)
+        return false;
+    if (k1779)
+        return rd64(task, base + (uint64_t)IL2CPP_TD_ACTOR * 8ULL) == k1779;
+    return rd64(task, base + (uint64_t)IL2CPP_TD_ACTOR * 8ULL) >= HUNT_PTR_MIN;
+}
+
+/* Re-read the table global until it agrees with the bootstrap class pointer. */
+static uint64_t def_table_verified(mach_port_t task, uint64_t ufBase,
+                                   uint64_t k1779, uint64_t seen)
+{
+    if (tid_base_valid(task, seen, k1779))
+        return seen;
+
+    for (int i = 0; i < 8; i++) {
+        usleep(250000);
+        if (gStopRequested.load())
+            break;
+
+        uint64_t b = rd64(task, ufBase + UF_DEF_TABLE_OFF);
+        if (tid_base_valid(task, b, k1779))
+            return b;
+    }
+    return 0;
+}
+
 /* Builds "Self < Parent < ..." for a class, up to CHAIN_MAX_HOPS, stopping on
    null or unreadable parents. Sets *hasTransform when "Transform" appears. */
 static void build_chain(mach_port_t task, uint64_t cls, uint64_t nameOff, uint64_t meta,
@@ -2032,6 +2131,24 @@ stopped:
         return;
     }
 
+    /* Round 45: verify the class table before the heap pass, which matches
+       every candidate object against its slots. */
+    {
+        uint64_t tb = def_table_verified(task, ctx.uf_base, ctx.k1779,
+                                         ctx.def_table);
+
+        if (!tb) {
+            [self logLine:@"FAIL: class table invalid (def_table=0x%llx)",
+                        ctx.def_table];
+            return;
+        }
+
+        if (tb != ctx.def_table) {
+            [self vlogLine:@"tidBase recovered = 0x%llx", tb];
+            ctx.def_table = tb;
+        }
+    }
+
     if (gStopRequested.load()) {
         [self logLine:@"scan stopped"];
         return;
@@ -2069,7 +2186,8 @@ stopped:
         return;
     }
 
-    uint64_t tidBase = rd64(task, ctx.uf_base + UF_DEF_TABLE_OFF);
+    /* Round 45: the table was verified before the heap pass; reuse it. */
+    uint64_t tidBase = ctx.def_table;
     uint64_t meta = ctx.metadata_base;
 
     /* ---------------- class discovery (file only) --------------------- */
@@ -2103,12 +2221,19 @@ stopped:
                     (off == nameOff) ? "  <- NAME_OFF" : ""];
     }
 
-    uint64_t tfCls = tid_class(task, tidBase, TD_UNITY_TRANSFORM);
+    /* Round 45: resolve Transform by name when its table slot reads back zero.
+       The slot index is verified against the class name before use. */
+    uint64_t tfTd = TD_UNITY_TRANSFORM;
+    uint64_t tfCls = haveName
+        ? tid_class_named(task, tidBase, TD_UNITY_TRANSFORM, meta, nameOff,
+                          "Transform", &tfTd)
+        : tid_class(task, tidBase, TD_UNITY_TRANSFORM);
     char tfName[40];
     tfName[0] = '\0';
     if (tfCls)
         class_name_at(task, tfCls, nameOff, meta, tfName, sizeof(tfName));
-    [self vlogLine:@"class(13036) = 0x%llx  name = %s", tfCls, tfName[0] ? tfName : "?"];
+    [self vlogLine:@"class(13036) = 0x%llx  name = %s td=%llu", tfCls,
+                tfName[0] ? tfName : "?", (unsigned long long)tfTd];
 
     uint64_t parentOff = 0;
     for (uint64_t off = 0; off <= PARENT_PROBE_END; off += 8) {
@@ -2161,6 +2286,25 @@ stopped:
         }
 
         uint64_t cls = tid_class(task, tidBase, td);
+
+        /* Round 45: a just-initialised type can still read back zero for a
+           moment after attach; give the slot one retry before calling it null.
+           When Transform resolved at another index, the same index shift is
+           applied to the field's type id. */
+        if (!cls) {
+            usleep(200000);
+            cls = tid_class(task, tidBase, td);
+        }
+        if (!cls && tfTd != TD_UNITY_TRANSFORM) {
+            uint64_t alt = td + tfTd - TD_UNITY_TRANSFORM;
+            cls = tid_class(task, tidBase, alt);
+            if (cls) {
+                [self vlogLine:@"field +0x%02llx td=%llu shifted -> td=%llu",
+                            off, (unsigned long long)td,
+                            (unsigned long long)alt];
+                td = alt;
+            }
+        }
         if (!cls) {
             [self vlogLine:@"field +0x%02llx td=%llu chain: <class null>",
                         off, (unsigned long long)td];
@@ -3254,7 +3398,8 @@ static int cam_obj_kind(mach_port_t task, uint64_t obj, uint64_t cls,
         return NO;
     }
 
-    uint64_t tfCls = tid_class(task, _tidBase, TD_UNITY_TRANSFORM);
+    uint64_t tfCls = tid_class_named(task, _tidBase, TD_UNITY_TRANSFORM,
+                                     _metaBase, _nameOff, "Transform", NULL);
 
     uint64_t direct = 0;      /* static field holding a Camera instance */
     uint64_t elem = 0;        /* Camera[] element (allCameras) */
