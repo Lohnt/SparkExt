@@ -1988,13 +1988,16 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
             vm_address_t cursor = addr;
             vm_size_t remaining = size;
             int failures = 0;
+            bool capped = false;
 
-            while (remaining >= 8 && found < maxout) {
+            while (remaining >= 8 && found < maxout && !capped) {
                 if (gStopRequested.load())
                     goto stopped;
 
-                if (rep->bytes_scanned >= SCAN_CAP_BYTES)
+                if (rep->bytes_scanned >= SCAN_CAP_BYTES) {
+                    capped = true;
                     break;
+                }
 
                 vm_size_t want = remaining < SCAN_CHUNK_SIZE ? remaining : SCAN_CHUNK_SIZE;
                 if (mr_read(task, cursor, chunk, want)) {
