@@ -23,6 +23,10 @@
 
 #define MAX_CANDIDATES 256
 #define SCAN_CHUNK_SIZE (1u << 20)
+/* Round 47: the candidate walk over the full heap took ~25 s for ~2 GB while
+   the TRS pass is already capped. 320 MB is enough to meet every live actor
+   on the current build and keeps a scan inside the 2-4 s budget. */
+#define SCAN_CAP_BYTES (320ULL * 1024ULL * 1024ULL)
 #define CLASS_REGION_RADIUS 0x100000ULL
 
 /* --- pointer walk / field hunter ---------------------------------------- */
@@ -1948,6 +1952,9 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
         if (gStopRequested.load())
             goto stopped;
 
+        if (rep->bytes_scanned >= SCAN_CAP_BYTES)
+            break;
+
         vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
@@ -1985,6 +1992,9 @@ static int scan_candidates(mach_port_t task, uint64_t k1779, uint64_t k7301,
             while (remaining >= 8 && found < maxout) {
                 if (gStopRequested.load())
                     goto stopped;
+
+                if (rep->bytes_scanned >= SCAN_CAP_BYTES)
+                    break;
 
                 vm_size_t want = remaining < SCAN_CHUNK_SIZE ? remaining : SCAN_CHUNK_SIZE;
                 if (mr_read(task, cursor, chunk, want)) {
@@ -2207,6 +2217,9 @@ stopped:
     double scanWall = CFAbsoluteTimeGetCurrent() - tScan;
     diag_log("diag: scan returned");
 
+    [self logLine:@"scan: scanned=%.1f MB cap=%.0f MB elapsed=%.2f",
+               (double)rep.bytes_scanned / (1024.0 * 1024.0),
+               (double)SCAN_CAP_BYTES / (1024.0 * 1024.0), scanWall];
     [self logLine:@"--- scan coverage ---"];
     [self logLine:@"  start address   = 0x%llx", rep.start];
     [self logLine:@"  regions visited = %llu", rep.regions_visited];
@@ -3709,8 +3722,10 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
 
     uint64_t vs[256];
     float ps[256 * 3];
+    short eye[256];
     int n = 0;
     int scanned = 0;
+    int fallbackProbes = 0;
 
     for (NSNumber *bn in _actorBases) {
         if (n >= 256 || scanned >= 4000 || gStopRequested.load())
@@ -3720,18 +3735,40 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
         uint64_t v = [bn unsignedLongLongValue];
         uint64_t t = rd64(task, v + VIEW_OFF_FIELD);
         float p[4];
+        bool fromView = false;
 
-        /* Round 44: only actors with a real view state are players. The old
-           component-cluster probe admitted corpses, props and spectator
-           cameras (17 bases instead of the 10 players). */
-        if (t < HUNT_PTR_MIN || !mr_read(task, t + 0x120, p, sizeof(p)))
+        memset(p, 0, sizeof(p));
+
+        /* Round 47: a remote actor may not publish a view state. Fall back to
+           its component cluster (Round 43 behaviour) but keep the team-byte
+           filter below, which is what rejects corpses, props and cameras. */
+        if (t >= HUNT_PTR_MIN && mr_read(task, t + 0x120, p, sizeof(p))) {
+            fromView = true;
+        } else if (fallbackProbes < 96) {
+            float hp[3];
+
+            fallbackProbes++;
+            if (!human_probe_ptr(task, v, hp, NULL))
+                continue;
+
+            p[0] = hp[0];
+            p[1] = hp[1];
+            p[2] = hp[2];
+            p[3] = 0.0f;
+        } else {
             continue;
+        }
+
         if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2]))
             continue;
         if (fabsf(p[0]) > 3000.0f || fabsf(p[2]) > 3000.0f)
             continue;
-        if (p[1] < 0.2f || p[1] > 15.0f)
+        if (fromView) {
+            if (p[1] < 0.2f || p[1] > 15.0f)
+                continue;
+        } else if (p[1] < -2.0f || p[1] > 6.0f) {
             continue;
+        }
         if (p[0] == 0.0f && p[2] == 0.0f)
             continue;
 
@@ -3761,6 +3798,7 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
         ps[n * 3 + 0] = p[0];
         ps[n * 3 + 1] = p[1];
         ps[n * 3 + 2] = p[2];
+        eye[n] = fromView ? 1 : 0;
         n++;
     }
 
@@ -3854,7 +3892,7 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
         else if (dist >= 0.0f)
             isFriend = (dist < 4.0f);   /* fallback: close actor is a teammate */
 
-        float rootY = py - 1.6f;
+        float rootY = py - (eye[i] ? 1.6f : 0.0f);
 
         if (dist > 30.0f) {
             if (logged < 12) {
@@ -4214,6 +4252,10 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
     int humanHits = 0;
     int humanBind = 0;
     int humanCull = 0;
+    int humanCand = 0;
+    int humanExact = 0;
+    int humanLoose = 0;
+    int humanMax = 0;
 
     /* Round 29 ESP: one camera decision per scan, then the roots below. Both go
        into the worker-owned staging buffer; nothing the overlay reads is written
@@ -4276,8 +4318,14 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
         for (int i = 0; i < narr; i++) {
             if (gStopRequested.load())
                 break;
+
+            if (arrs[i].count > humanMax)
+                humanMax = arrs[i].count;
+
             if (arrs[i].count < PLANET_HUMAN_MIN)
                 continue;
+
+            humanCand++;
 
             /* slot0..slot8 as raw TRS rows: pos, quat, scale. The signature
                decides membership; the bind-pose test decides drawability. */
@@ -4289,8 +4337,13 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
 
             int sig = human_sig_start(trs, rows);
 
-            if (sig < 0)
+            if (sig >= 0) {
+                humanExact++;
+            } else {
                 sig = human_sig_loose(trs, rows);
+                if (sig >= 0)
+                    humanLoose++;
+            }
 
             if (sig < 0)
                 continue;
