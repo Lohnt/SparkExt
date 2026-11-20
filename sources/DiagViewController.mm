@@ -4,6 +4,7 @@
 #import "Il2Cpp.h"
 #import "DiagLog.h"
 #import "EspDraw.h"
+#import "OverlayWindow.h"
 
 #import <UIKit/UIKit.h>
 #include <atomic>
@@ -225,6 +226,17 @@ static bool diag_sleep_checked(double seconds)
 
 - (void)startRun
 {
+    static CFAbsoluteTime lastAccept = 0.0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+
+    /* Round 46: a double-fired action used to queue two whole scans (two
+       "scanning heap..." passes). Accept at most one request per 2 s. */
+    if (now - lastAccept < 2.0) {
+        diag_log("diag: startRun ignored (debounce)");
+        return;
+    }
+    lastAccept = now;
+
     gStopRequested.store(true);
 
     __weak typeof(self) weakSelf = self;
@@ -268,6 +280,12 @@ static bool diag_sleep_checked(double seconds)
     diag_log("diag: rescan pressed");
     _textView.text = @"";
     [self logLine:@"rescan from worker queue"];
+
+    /* Round 46: RESCAN runs the same bounded ESP pipeline as ESP RESCAN so a
+       tap stays one capped scan instead of the full diagnostic walk. */
+    _espMode = YES;
+    [[OverlayWindow shared] espShow:YES];
+
     [self startRun];
 }
 

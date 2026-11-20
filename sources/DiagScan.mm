@@ -93,6 +93,10 @@
 #define PLANET_TRS_POS      12
 #define PLANET_TRS_OUT_MAX  4000
 #define PLANET_TRS_COLLECT  200000   /* slots kept for grouping */
+/* Round 46: the TRS walk used to cover the whole selected heap (~1.9 GB,
+   ~25 s). ESP mode caps it; regions that hold actor objects and hunt anchors
+   are visited first so the humanoid chains are reached inside the cap. */
+#define PLANET_TRS_ESP_BYTES (320ULL * 1024ULL * 1024ULL)
 #define PLANET_GHOST_LO     0x16c140000ULL
 #define PLANET_GHOST_HI     0x16c150000ULL
 #define PLANET_GHOST_MAX    128
@@ -980,6 +984,43 @@ static int human_sig_start(const uint8_t *raw, int rows)
         int ok = 1;
         for (int k = 0; k < 4; k++) {
             if (fabsf(y[i + 1 + k] - kAbs[k]) > 0.01f) {
+                ok = 0;
+                break;
+            }
+        }
+
+        if (ok)
+            return i;
+    }
+
+    return -1;
+}
+
+/* Round 46: looser humanoid test. The Round 31 fingerprint is exact to 0.01 m
+   and some skeleton layouts no longer match it, which left the humanoid list
+   empty. This fallback only asks for a plausible head height followed by four
+   short bone rows; it is used when the strict signature misses. */
+static int human_sig_loose(const uint8_t *raw, int rows)
+{
+    if (!raw || rows < PLANET_HUMAN_ROWS)
+        return -1;
+
+    float y[PLANET_HUMAN_ROWS];
+    for (int k = 0; k < PLANET_HUMAN_ROWS; k++) {
+        float v = 0.0f;
+        memcpy(&v, raw + (size_t)k * 0x30 + 4, sizeof(v));
+        if (!isfinite(v))
+            return -1;
+        y[k] = v;
+    }
+
+    for (int i = 0; i <= 3; i++) {
+        if (y[i] < 0.3f || y[i] > 1.8f)
+            continue;
+
+        int ok = 1;
+        for (int k = 1; k <= 4; k++) {
+            if (y[i + k] < 0.02f || y[i + k] > 0.6f) {
                 ok = 0;
                 break;
             }
@@ -2106,6 +2147,7 @@ stopped:
     }
 
     [self vlogLine:@"=== scan start ==="];
+    CFAbsoluteTime tRunStart = CFAbsoluteTimeGetCurrent();
 
     il2cpp_ctx ctx;
     il2cpp_bootstrap(task, &ctx);
@@ -2542,6 +2584,7 @@ stopped:
     free(buf);
 
     diag_log("diag: scan complete");
+    [self logLine:@"scan done in %.2f s", CFAbsoluteTimeGetCurrent() - tRunStart];
 }
 
 /* ---------------- VIEW phase ------------------------------------------ */
@@ -3738,20 +3781,37 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
     }
 
     int localTeam = 0;
-    int teamOff = [self teamOffsetForActors:task vs:vs count:n localV:localV
+
+    /* Round 46: team ids do not depend on the view state. Probe every actor
+       base, not only the handful with a live eye, so the sweep still sees
+       teammates and enemies when the view filter is strict. */
+    uint64_t tv[512];
+    int tn = 0;
+
+    for (NSNumber *bn in _actorBases) {
+        if (tn >= 512)
+            break;
+        tv[tn++] = [bn unsignedLongLongValue];
+    }
+    if (tn < 2 && n >= 2) {
+        memcpy(tv, vs, sizeof(uint64_t) * (size_t)n);
+        tn = n;
+    }
+
+    int teamOff = [self teamOffsetForActors:task vs:tv count:tn localV:localV
                                       local:&localTeam];
 
     if (teamOff >= 0) {
         int shown = 0;
 
-        for (int i = 0; i < n && shown < 8; i++) {
-            int val = actor_team_at(task, vs[i], teamOff);
+        for (int i = 0; i < tn && shown < 8; i++) {
+            int val = actor_team_at(task, tv[i], teamOff);
             if (val < 0)
                 continue;
             shown++;
             [self vlogLine:@"team: sample V=0x%llx val=%d%s",
-                        (unsigned long long)vs[i], val,
-                        (vs[i] == localV) ? " LOCAL" : ""];
+                        (unsigned long long)tv[i], val,
+                        (tv[i] == localV) ? " LOCAL" : ""];
         }
     }
 
@@ -3796,15 +3856,6 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
 
         float rootY = py - 1.6f;
 
-        if (_actorRootN < ESP_MAX_BOXES) {
-            _actorRootP[_actorRootN * 3 + 0] = px;
-            _actorRootP[_actorRootN * 3 + 1] = rootY;
-            _actorRootP[_actorRootN * 3 + 2] = pz;
-            _actorRootV[_actorRootN] = v;
-            _actorRootTeam[_actorRootN] = isFriend ? 1 : 0;
-            _actorRootN++;
-        }
-
         if (dist > 30.0f) {
             if (logged < 12) {
                 logged++;
@@ -3813,6 +3864,17 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
                             isFriend ? "FRIEND" : "ENEMY", dist];
             }
             continue;
+        }
+
+        /* Round 46: only in-range actors feed the root list used for skeleton
+           team matching and bind=1 owner pairing. */
+        if (_actorRootN < ESP_MAX_BOXES) {
+            _actorRootP[_actorRootN * 3 + 0] = px;
+            _actorRootP[_actorRootN * 3 + 1] = rootY;
+            _actorRootP[_actorRootN * 3 + 2] = pz;
+            _actorRootV[_actorRootN] = v;
+            _actorRootTeam[_actorRootN] = isFriend ? 1 : 0;
+            _actorRootN++;
         }
 
         if (isFriend) {
@@ -3836,6 +3898,28 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
     [self vlogLine:@"esp: actors valid=%d staged=%d friends=%d teamOff=0x%x localTeam=%d localV=0x%llx",
                 valid, staged, friends, teamOff, localTeam,
                 (unsigned long long)localV];
+}
+
+/* Round 46: binary search over the base-sorted selected regions. Returns the
+   index whose [base, base+size) range holds addr, or -1. */
+static int region_index_for(const planet_region *regs, int n, uint64_t addr)
+{
+    int lo = 0;
+    int hi = n - 1;
+
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        uint64_t b = regs[mid].base;
+
+        if (addr < b) {
+            hi = mid - 1;
+        } else if (addr >= b + regs[mid].size) {
+            lo = mid + 1;
+        } else {
+            return mid;
+        }
+    }
+    return -1;
 }
 
 /* Independent of the changed blocks: walks the same region list PLANETARY A
@@ -3888,12 +3972,58 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
         [anchors addObject:n];
     }
 
-    for (int r = 0; r < count && !capped; r++) {
+    /* Round 46: visit the regions that hold actor objects and hunt anchors
+       first, then the rest. ESP mode stops at a byte cap; non-ESP runs still
+       walk everything. */
+    int *ord = NULL;
+    uint8_t *hot = NULL;
+    uint64_t walkCap = _espMode ? PLANET_TRS_ESP_BYTES : 0;
+    uint64_t walked = 0;
+
+    if (count > 0) {
+        ord = (int *)malloc((size_t)count * sizeof(int));
+        hot = (uint8_t *)calloc((size_t)count, 1);
+
+        if (ord && hot) {
+            int k = 0;
+
+            for (NSNumber *bn in _actorBases) {
+                int idx = region_index_for(regs, count,
+                                           [bn unsignedLongLongValue]);
+                if (idx >= 0)
+                    hot[idx] = 1;
+            }
+            for (NSNumber *an in anchors) {
+                int idx = region_index_for(regs, count,
+                                           [an unsignedLongLongValue]);
+                if (idx >= 0)
+                    hot[idx] = 1;
+            }
+
+            for (int i = 0; i < count; i++)
+                if (hot[i])
+                    ord[k++] = i;
+            for (int i = 0; i < count; i++)
+                if (!hot[i])
+                    ord[k++] = i;
+        } else {
+            free(ord);
+            ord = NULL;
+        }
+        free(hot);
+        hot = NULL;
+    }
+
+    for (int oi = 0; oi < count && !capped; oi++) {
         if (gStopRequested.load()) {
             stopped = true;
             break;
         }
 
+        if (walkCap && walked >= walkCap)
+            break;
+
+        int r = ord ? ord[oi] : oi;
         uint64_t end = regs[r].base + regs[r].size;
         uint64_t p = regs[r].base;
         uint64_t mis = p % PLANET_TRS_STRIDE;
@@ -3906,6 +4036,9 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
                 stopped = true;
                 break;
             }
+
+            if (walkCap && walked >= walkCap)
+                break;
 
             uint64_t left = end - p;
             size_t want = (size_t)(left < (uint64_t)PLANET_TRS_CHUNK
@@ -3987,11 +4120,13 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
             }
 
             scanned += want;
+            walked += want;
             p += want;
         }
     }
 
     free(chunk);
+    free(ord);
 
     qsort(slots, (size_t)nslots, sizeof(trs_slot), trs_cmp_addr);
 
@@ -4014,8 +4149,9 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
 
     [self logLine:@"TRS: %d slots in %d arrays", nslots, narr];
 
-    [self vlogLine:@"trs: scanned=%.1f MB reads=%d fails=%d collect=%d/%d %s%s elapsed=%.2f",
-                (double)scanned / (1024.0 * 1024.0), reads, readFails,
+    [self vlogLine:@"trs: scanned=%.1f MB cap=%.0f MB reads=%d fails=%d collect=%d/%d %s%s elapsed=%.2f",
+                (double)scanned / (1024.0 * 1024.0),
+                (double)walkCap / (1024.0 * 1024.0), reads, readFails,
                 nslots, PLANET_TRS_COLLECT,
                 capped ? "CAPPED " : "", stopped ? "STOPPED " : "",
                 CFAbsoluteTimeGetCurrent() - t0];
@@ -4152,6 +4288,10 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
             int rows = (int)(th / 0x30);
 
             int sig = human_sig_start(trs, rows);
+
+            if (sig < 0)
+                sig = human_sig_loose(trs, rows);
+
             if (sig < 0)
                 continue;
 
@@ -4607,6 +4747,14 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
 
         planet_region *r = &sel[i];
         r->nblocks = (uint32_t)(r->size / PLANET_BLOCK);
+
+        /* Round 46: ESP mode does not consume the differential snapshot and
+           hashing the whole selected heap doubled the scan time. The region
+           list is all the TRS/humanoid pass needs. */
+        if (_espMode) {
+            r->hash = NULL;
+            continue;
+        }
 
         planet_region *old = havePrev ? planet_find(_planetRegs, _planetNRegs, r->base) : NULL;
         bool match = (old && old->size == r->size && old->hash &&
