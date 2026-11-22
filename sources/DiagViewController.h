@@ -110,6 +110,9 @@ typedef struct {
     float *_moverRootsCached;
     int _moverRootsCachedN;
 
+    /* Mover ESP roots staged this scan. */
+    int _moverRootN;
+
     /* Round 34: metadata handles kept from bootstrap so the Camera::main
        resolver can run after the heap pass. */
     uint64_t _ufBase;
