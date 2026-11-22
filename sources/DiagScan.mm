@@ -3920,6 +3920,15 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
             _allActorPos[_allActorN * 3 + 2] = p[2];
             _allActorTeam[_allActorN] = val;
             _allActorN++;
+
+            /* Round 50: capture local player pos from full tv scan. */
+            if (v == localV && !_localPosValid) {
+                _localPos[0] = p[0];
+                _localPos[1] = rootY;
+                _localPos[2] = p[2];
+                _localPosValid = YES;
+                [self vlogLine:@"local: pos=(%.2f,%.2f,%.2f) from tv scan", p[0], p[1], p[2]];
+            }
         }
     }
 
