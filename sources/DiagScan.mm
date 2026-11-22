@@ -4445,7 +4445,6 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
     if (arrs) {
         uint64_t usedRoots[ESP_MAX_BOXES];
         int nUsedRoots = 0;
-        int actorCover = (_actorRootN > 0);
 
         for (int i = 0; i < narr; i++) {
             if (gStopRequested.load())
@@ -4700,12 +4699,25 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
                         teamtag, (unsigned long long)dist,
                         rootP[0], rootP[1], rootP[2], culltag];
 
-            if (drawable && !culled && !actorCover && _espMode &&
-                _espStageN < ESP_MAX_BOXES) {
-                _espStageRoots[_espStageN * 3 + 0] = rootP[0];
-                _espStageRoots[_espStageN * 3 + 1] = rootP[1];
-                _espStageRoots[_espStageN * 3 + 2] = rootP[2];
-                _espStageN++;
+            /* Round 50: per-skeleton spatial dedupe against actor roots.
+               Only stage if not already covered by an actor root (within 2m). */
+            BOOL covered = NO;
+            if (drawable && !culled && _espMode && _espStageN < ESP_MAX_BOXES) {
+                for (int k = 0; k < _actorRootN; k++) {
+                    float dx = rootP[0] - _actorRootP[k * 3 + 0];
+                    float dy = rootP[1] - _actorRootP[k * 3 + 1];
+                    float dz = rootP[2] - _actorRootP[k * 3 + 2];
+                    if (dx * dx + dy * dy + dz * dz <= 4.0f) {  /* 2m squared */
+                        covered = YES;
+                        break;
+                    }
+                }
+                if (!covered) {
+                    _espStageRoots[_espStageN * 3 + 0] = rootP[0];
+                    _espStageRoots[_espStageN * 3 + 1] = rootP[1];
+                    _espStageRoots[_espStageN * 3 + 2] = rootP[2];
+                    _espStageN++;
+                }
             }
 
             NSNumber *bkey = [NSNumber numberWithUnsignedLongLong:arrs[i].base];
