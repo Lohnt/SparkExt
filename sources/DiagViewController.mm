@@ -58,6 +58,10 @@ static bool diag_sleep_checked(double seconds)
     _prevSelfValid = NO;
     _humanPrev = [NSMutableSet set];
 
+    /* Round 47: mover ESP cache. */
+    _moverRootsCached = NULL;
+    _moverRootsCachedN = 0;
+
     /* Round 29 ESP state: the toggle and FOV index are UI-owned; the roots and
        camera live in the worker staging buffer until espCompleteScan publishes
        an immutable snapshot. */

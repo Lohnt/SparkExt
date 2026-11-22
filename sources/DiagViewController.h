@@ -106,6 +106,10 @@ typedef struct {
     float _espStageCamP[3];
     float _espStageCamF[3];
 
+    /* Round 47: cached mover positions from last planetary scan (feet positions). */
+    float *_moverRootsCached;
+    int _moverRootsCachedN;
+
     /* Round 34: metadata handles kept from bootstrap so the Camera::main
        resolver can run after the heap pass. */
     uint64_t _ufBase;

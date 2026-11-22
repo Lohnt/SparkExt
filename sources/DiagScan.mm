@@ -2175,6 +2175,7 @@ stopped:
         _espStageBind = 0;
         _espStageHaveCam = NO;
         _espStageCamSrc = 0;
+        _moverRootN = 0;   /* Round 47: mover ESP roots */
     }
 
     [self vlogLine:@"=== scan start ==="];
@@ -3959,6 +3960,50 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
                 (unsigned long long)localV];
 }
 
+/* Round 47: stage mover (entity record) positions into ESP.
+   Mover positions come from planetary MOVER scan — position addresses that
+   changed between scans. These are bot positions (feet level), work regardless
+   of render state. Appends to _espStageRoots (the snapshot buffer). */
+- (void)stageMoverRootsTask:(mach_port_t)task haveCam:(BOOL)haveCam
+                       camP:(const float *)camP
+{
+    if (!_moverRootsCached || _moverRootsCachedN == 0)
+        return;
+
+    int staged = 0;
+
+    for (int i = 0; i < _moverRootsCachedN && _espStageN < ESP_MAX_BOXES; i++) {
+        float px = _moverRootsCached[i * 3 + 0];
+        float py = _moverRootsCached[i * 3 + 1];
+        float pz = _moverRootsCached[i * 3 + 2];
+
+        if (!isfinite(px) || !isfinite(py) || !isfinite(pz))
+            continue;
+        if (fabsf(px) > 3000.0f || fabsf(pz) > 3000.0f)
+            continue;
+        if (py < -2.0f || py > 50.0f)
+            continue;
+
+        if (haveCam) {
+            float dx = px - camP[0];
+            float dy = py - camP[1];
+            float dz = pz - camP[2];
+            float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (dist > 300.0f)
+                continue;
+        }
+
+        /* Mover positions are at feet level (rootY = py) */
+        _espStageRoots[_espStageN * 3 + 0] = px;
+        _espStageRoots[_espStageN * 3 + 1] = py;
+        _espStageRoots[_espStageN * 3 + 2] = pz;
+        _espStageN++;
+        staged++;
+    }
+
+    [self vlogLine:@"esp: mover roots staged=%d (total esp roots=%d)", staged, _espStageN];
+}
+
 /* Round 46: binary search over the base-sorted selected regions. Returns the
    index whose [base, base+size) range holds addr, or -1. */
 static int region_index_for(const planet_region *regs, int n, uint64_t addr)
@@ -4326,6 +4371,9 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
            skeletons and carry the team field; the skeleton loop below only
            stages when no actor was resolvable. */
         [self stageActorRootsTask:task haveCam:haveCamP camP:camP];
+
+        /* Round 47: mover (entity record) roots — bots work when render paused. */
+        [self stageMoverRootsTask:task haveCam:haveCamP camP:camP];
     } else {
         _actorRootN = 0;
     }
@@ -5440,6 +5488,24 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
                 [self logLine:@"%@", line];
             else
                 [self vlogLine:@"%@", line];
+        }
+    }
+
+    /* Round 47: cache mover positions for ESP (feet-level bot positions).
+       These work even when render is paused because server simulates bots. */
+    if (movedN > 0) {
+        if (_moverRootsCached)
+            free(_moverRootsCached);
+        int cap = movedN < ESP_MAX_BOXES ? movedN : ESP_MAX_BOXES;
+        _moverRootsCached = (float *)malloc((size_t)cap * 3 * sizeof(float));
+        _moverRootsCachedN = 0;
+
+        for (int i = 0; i < cap; i++) {
+            mover_rec *mr = &movedList[i];
+            _moverRootsCached[_moverRootsCachedN * 3 + 0] = mr->nx;
+            _moverRootsCached[_moverRootsCachedN * 3 + 1] = mr->ny;
+            _moverRootsCached[_moverRootsCachedN * 3 + 2] = mr->nz;
+            _moverRootsCachedN++;
         }
     }
 
