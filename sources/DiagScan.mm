@@ -4637,7 +4637,7 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
 
     _espStageBind = _espMode ? humanBind : 0;
 
-    [self vlogLine:@"human: %d arrays (>=%d slots, head y %.2f..%.2f) bind=%d culled=%d / %d anchors",
+    [self vlogLine:@"human: %d arrays (>=%d slots, head rel %.2f..%.2f) bind=%d culled=%d / %d anchors",
                 humanHits, PLANET_HUMAN_MIN, PLANET_HUMAN_HEADLO,
                 PLANET_HUMAN_HEADHI, humanBind, humanCull,
                 (int)anchors.count];
