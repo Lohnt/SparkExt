@@ -110,8 +110,9 @@
    60. Qualification is the head height plus the four bone gaps below. */
 #define PLANET_HUMAN_MIN    60      /* slots in a humanoid transform array */
 #define PLANET_HUMAN_MAX    40      /* screen lines */
-#define PLANET_HUMAN_HEADLO 0.90f
-#define PLANET_HUMAN_HEADHI 1.00f
+/* Round 49: widened for CriticalOps bind-pose model (head at ~2.7-3.3 from root). */
+#define PLANET_HUMAN_HEADLO 0.50f
+#define PLANET_HUMAN_HEADHI 3.50f
 #define PLANET_HUMAN_OWNER  0x100    /* owner header window before base */
 #define PLANET_HUMAN_ROWS   9        /* slot0..slot8 */
 #define PLANET_HUMAN_PRE    0x200    /* companion transform window before base */
@@ -1037,7 +1038,8 @@ static int human_sig_loose(const uint8_t *raw, int rows)
     }
 
     for (int i = 0; i <= 3; i++) {
-        if (y[i] < 0.3f || y[i] > 1.8f)
+        /* Round 49: widened for CriticalOps bind-pose model (head at ~2.7-3.3). */
+        if (y[i] < 0.3f || y[i] > 3.5f)
             continue;
 
         int ok = 1;
