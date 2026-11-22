@@ -26,7 +26,7 @@
 /* Round 47: the candidate walk over the full heap took ~25 s for ~2 GB while
    the TRS pass is already capped. 320 MB is enough to meet every live actor
    on the current build and keeps a scan inside the 2-4 s budget. */
-#define SCAN_CAP_BYTES (320ULL * 1024ULL * 1024ULL)
+#define SCAN_CAP_BYTES (1024ULL * 1024ULL * 1024ULL)   /* 1 GB: full actor coverage */
 #define CLASS_REGION_RADIUS 0x100000ULL
 
 /* --- pointer walk / field hunter ---------------------------------------- */
@@ -73,7 +73,7 @@
 
 /* --- round 24: PLANETARY full-heap differential -------------------------- */
 #define PLANET_BLOCK        0x20ULL
-#define PLANET_CAP_BYTES    (320ULL * 1024ULL * 1024ULL)
+#define PLANET_CAP_BYTES    (1024ULL * 1024ULL * 1024ULL)   /* 1 GB: reach bot skeletons */
 #define PLANET_REGION_MAX   8192
 #define PLANET_CHANGED_MAX  (2u * 1024u * 1024u)
 #define PLANET_WIN          0x100    /* dump window per changed block */
@@ -100,7 +100,7 @@
 /* Round 46: the TRS walk used to cover the whole selected heap (~1.9 GB,
    ~25 s). ESP mode caps it; regions that hold actor objects and hunt anchors
    are visited first so the humanoid chains are reached inside the cap. */
-#define PLANET_TRS_ESP_BYTES (320ULL * 1024ULL * 1024ULL)
+#define PLANET_TRS_ESP_BYTES (1024ULL * 1024ULL * 1024ULL)   /* 1 GB: reach bot skeletons */
 #define PLANET_GHOST_LO     0x16c140000ULL
 #define PLANET_GHOST_HI     0x16c150000ULL
 #define PLANET_GHOST_MAX    128
