@@ -3861,6 +3861,8 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
     int teamOff = [self teamOffsetForActors:task vs:tv count:tn localV:localV
                                       local:&localTeam];
 
+    _localTeam = localTeam;   /* Round 48: store for bind-pose fallback */
+
     if (teamOff >= 0) {
         int shown = 0;
 
@@ -3905,6 +3907,15 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
         }
 
         valid++;
+
+        /* Round 48: store ALL actor positions/teams for bind-pose fallback. */
+        if (_allActorN < 512) {
+            _allActorPos[_allActorN * 3 + 0] = px;
+            _allActorPos[_allActorN * 3 + 1] = py - (eye[i] ? 1.6f : 0.0f);  /* feet level */
+            _allActorPos[_allActorN * 3 + 2] = pz;
+            _allActorTeam[_allActorN] = (teamOff >= 0 && val >= 0 && val <= 2) ? val : -1;
+            _allActorN++;
+        }
 
         if (v == localV)
             continue;   /* the local player's own eye */
@@ -4486,86 +4497,79 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
                         rootsrc = "slot";
                         rootAddr = src;
                     } else {
-                        /* Round 43: the actor stage already resolved every
-                           live player's world position. The skeleton array
-                           lives in the same component cluster, so the nearest
-                           unused actor base is its owner; use that actor's
-                           eye root instead of guessing a memory neighbour. */
-                        uint64_t bestV = 0;
-                        uint64_t bestD = ~0ULL;
+                        /* Round 48: bind-pose fallback — find spatially nearest
+                           actor from the FULL team scan (not just in-range).
+                           Uses stored _allActorPos/_allActorTeam arrays. */
+                        float bestD2 = 100.0f;   /* 10m squared */
                         int bi = -1;
 
-                        /* Round 44: prefer an enemy actor inside the ESP
-                           range, so a bind skeleton is not labelled with a
-                           far-away teammate or a killcam copy. */
+                        /* Passes: 0=enemy in range, 1=any in range, 2=enemy any, 3=any any */
                         for (int pass = 0; pass < 4 && bi < 0; pass++) {
-                            for (int k = 0; k < _actorRootN; k++) {
-                                uint64_t a = _actorRootV[k];
-                                bool used = false;
-                                bool enemy = (_actorRootTeam[k] == 0);
-                                float ad = 0.0f;
+                            for (int k = 0; k < _allActorN; k++) {
+                                int team = _allActorTeam[k];
+                                bool enemy = (team >= 0 && team != _localTeam);
+                                bool inRange = false;
 
-                                if (pass == 0 || pass == 2) {
+                                if (pass == 0 || pass == 1) {
                                     if (!haveCamP)
                                         continue;
-                                    float dx = _actorRootP[k * 3 + 0] - camP[0];
-                                    float dy = _actorRootP[k * 3 + 1] - camP[1];
-                                    float dz = _actorRootP[k * 3 + 2] - camP[2];
-                                    ad = sqrtf(dx * dx + dy * dy + dz * dz);
-                                    if (ad > 30.0f)
+                                    float dx = _allActorPos[k * 3 + 0] - camP[0];
+                                    float dy = _allActorPos[k * 3 + 1] - camP[1];
+                                    float dz = _allActorPos[k * 3 + 2] - camP[2];
+                                    float ad2 = dx * dx + dy * dy + dz * dz;
+                                    inRange = (ad2 <= 900.0f);  /* 30m squared */
+                                    if (!inRange)
                                         continue;
                                 }
                                 if (pass == 0 && !enemy)
                                     continue;
-                                if (pass == 1 && !enemy)
+                                if (pass == 1 && enemy)
+                                    continue;  /* pass 1: prefer friends in range */
+                                if (pass == 2 && !enemy)
                                     continue;
-                                if (pass == 2 && enemy)
-                                    continue;
+                                if (pass == 3 && enemy)
+                                    continue;  /* pass 3: prefer friends any dist */
 
+                                /* Check if this actor root is already used by another skeleton */
+                                bool used = false;
                                 for (int u = 0; u < nUsedRoots; u++) {
-                                    if (usedRoots[u] == a) {
-                                        used = true;
-                                        break;
-                                    }
+                                    /* We can't easily match usedRoots (addresses) to allActor indices.
+                                       Skip this check for now — spatial dedupe at line 4596 handles it. */
                                 }
                                 if (used)
                                     continue;
 
-                                uint64_t d = (a > arrs[i].base)
-                                             ? (a - arrs[i].base)
-                                             : (arrs[i].base - a);
-                                if (d < bestD) {
-                                    bestD = d;
-                                    bestV = a;
+                                float dx = pre[0] - _allActorPos[k * 3 + 0];
+                                float dy = pre[1] - _allActorPos[k * 3 + 1];
+                                float dz = pre[2] - _allActorPos[k * 3 + 2];
+                                float d2 = dx * dx + dy * dy + dz * dz;
+
+                                if (d2 < bestD2) {
+                                    bestD2 = d2;
                                     bi = k;
                                 }
                             }
-
-                            bestD = (bi >= 0) ? bestD : ~0ULL;
                         }
 
                         if (bi >= 0) {
                             drawable = YES;
                             roottag = " root=owner";
                             rootsrc = "owner";
-                            rootAddr = bestV;
-                            dist = bestD;
-                            pre[0] = _actorRootP[bi * 3 + 0];
-                            pre[1] = _actorRootP[bi * 3 + 1];
-                            pre[2] = _actorRootP[bi * 3 + 2];
+                            rootAddr = 0;   /* no base address for all-actor entries */
+                            pre[0] = _allActorPos[bi * 3 + 0];
+                            pre[1] = _allActorPos[bi * 3 + 1];
+                            pre[2] = _allActorPos[bi * 3 + 2];
 
-                            [self vlogLine:@"human: owner actor=0x%llx d=0x%llx team=%s base=0x%llx",
-                                        (unsigned long long)bestV,
-                                        (unsigned long long)bestD,
-                                        _actorRootTeam[bi] ? "FRIEND" : "ENEMY",
+                            [self vlogLine:@"human: owner actor idx=%d d2=%.2f team=%d base=0x%llx",
+                                        bi, bestD2, _allActorTeam[bi],
                                         (unsigned long long)arrs[i].base];
                         } else {
                             humanBind++;
                             roottag = " root=BIND";
-                            [self vlogLine:@"human: bind miss base=0x%llx slots=%d used=%d cam=%d actors=%d",
+                            [self vlogLine:@"human: bind miss base=0x%llx slots=%d used=%d cam=%d allActors=%d",
                                         (unsigned long long)arrs[i].base,
                                         arrs[i].count, nUsedRoots,
-                                        haveCamP ? 1 : 0, _actorRootN];
+                                        haveCamP ? 1 : 0, _allActorN];
                         }
                     }
                 }

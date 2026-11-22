@@ -113,6 +113,15 @@ typedef struct {
     /* Mover ESP roots staged this scan. */
     int _moverRootN;
 
+    /* Round 48: ALL actor positions/teams from team scan (not just in-range).
+       Used by bind-pose skeleton fallback to find spatially nearest actor. */
+    float _allActorPos[512 * 3];
+    int _allActorTeam[512];
+    int _allActorN;
+
+    /* Round 48: local player's team id (set in stageActorRootsTask). */
+    int _localTeam;
+
     /* Round 34: metadata handles kept from bootstrap so the Camera::main
        resolver can run after the heap pass. */
     uint64_t _ufBase;
