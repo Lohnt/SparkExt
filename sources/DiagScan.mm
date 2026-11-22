@@ -143,16 +143,26 @@ typedef struct {
 } field_desc;
 
 static const field_desc kActorFields[] = {
-    { 0x018, 7301ULL },
-    { 0x020, 7506ULL },
-    { 0x028, 5957ULL },
-    { 0x030, 5878ULL },
-    { 0x038, 7395ULL },
-    { 0x040, 6159ULL },
-    { 0x048, 3210ULL },
-    { 0x050, 3196ULL },
-    { 0x058, 3421ULL },
-    { 0x060, 7043ULL },
+    { 0x010, 0ULL },       /* Frida scan: field at +0x10 */
+    { 0x014, 0ULL },       /* Frida scan: field at +0x14 */
+    { 0x018, 7301ULL },    /* transform / config link */
+    { 0x01c, 0ULL },       /* Frida scan: field at +0x1c */
+    { 0x020, 7506ULL },    /* transform */
+    { 0x024, 0ULL },       /* TEAM BYTE (Frida confirmed) - TD unknown, metadata stripped */
+    { 0x026, 0ULL },       /* Frida scan: field at +0x26 */
+    { 0x028, 5957ULL },    /* health */
+    { 0x02a, 0ULL },       /* Frida scan: field at +0x2a */
+    { 0x02c, 0ULL },       /* Frida scan: field at +0x2c */
+    { 0x02e, 0ULL },       /* Frida scan: field at +0x2e */
+    { 0x030, 5878ULL },    /* viewState (td5878) */
+    { 0x034, 0ULL },       /* Frida scan: field at +0x34 */
+    { 0x038, 7395ULL },    /* bones / bindPose array */
+    { 0x040, 6159ULL },    /* bones / bindPose */
+    { 0x042, 0ULL },       /* Frida scan: field at +0x42 */
+    { 0x048, 3210ULL },    /* bones / bindPose */
+    { 0x050, 3196ULL },    /* bones / bindPose */
+    { 0x058, 3421ULL },    /* bones / bindPose */
+    { 0x060, 7043ULL },    /* bones / bindPose */
     { 0x068, 3273ULL },
     { 0x070, 9007199337086152ULL },
     { 0x078, 92ULL },
