@@ -122,6 +122,11 @@ typedef struct {
     /* Round 48: local player's team id (set in stageActorRootsTask). */
     int _localTeam;
 
+    /* Round 50: local player's feet position (from team scan).
+       Used as reference for bind-pose fallback when camera unavailable. */
+    float _localPos[3];
+    BOOL _localPosValid;
+
     /* Round 34: metadata handles kept from bootstrap so the Camera::main
        resolver can run after the heap pass. */
     uint64_t _ufBase;

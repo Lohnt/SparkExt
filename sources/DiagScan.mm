@@ -3865,6 +3865,22 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
 
     _localTeam = localTeam;   /* Round 48: store for bind-pose fallback */
 
+    /* Round 50: read local player's view state directly for fallback position.
+       This works even when camera fails and local player not in vs array. */
+    if (localV && teamOff >= 0) {
+        uint64_t localT = rd64(task, localV + VIEW_OFF_FIELD);
+        if (localT) {
+            float p[4];
+            if (mr_read(task, localT + 0x120, p, sizeof(p)) == sizeof(p)) {
+                _localPos[0] = p[0];
+                _localPos[1] = p[1] - 1.6f;  /* feet level */
+                _localPos[2] = p[2];
+                _localPosValid = YES;
+                [self vlogLine:@"local: pos=(%.2f,%.2f,%.2f) from view state", p[0], p[1], p[2]];
+            }
+        }
+    }
+
     if (teamOff >= 0) {
         int shown = 0;
 
@@ -3919,8 +3935,15 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
             _allActorN++;
         }
 
-        if (v == localV)
+        /* Round 50: capture local player's feet position for bind-pose fallback
+           when camera is unavailable. */
+        if (v == localV) {
+            _localPos[0] = px;
+            _localPos[1] = py - (eye[i] ? 1.6f : 0.0f);
+            _localPos[2] = pz;
+            _localPosValid = YES;
             continue;   /* the local player's own eye */
+        }
 
         if (teamOff >= 0)
             isFriend = (val == localTeam);
@@ -4499,13 +4522,23 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
                         rootsrc = "slot";
                         rootAddr = src;
                     } else {
-                        /* Round 48: bind-pose fallback — find spatially nearest
+                        /* Round 48/50: bind-pose fallback — find spatially nearest
                            actor from the FULL team scan (not just in-range).
-                           Uses stored _allActorPos/_allActorTeam arrays. */
+                           Uses stored _allActorPos/_allActorTeam arrays.
+                           Reference point: camera if available, else local player. */
+                        float refX, refY, refZ;
+                        if (haveCamP) {
+                            refX = camP[0]; refY = camP[1]; refZ = camP[2];
+                        } else if (_localPosValid) {
+                            refX = _localPos[0]; refY = _localPos[1]; refZ = _localPos[2];
+                        } else {
+                            refX = refY = refZ = 0.0f;
+                        }
+
                         float bestD2 = 100.0f;   /* 10m squared */
                         int bi = -1;
 
-                        /* Passes: 0=enemy in range, 1=any in range, 2=enemy any, 3=any any */
+                        /* Passes: 0=enemy in range, 1=friend in range, 2=enemy any, 3=friend any */
                         for (int pass = 0; pass < 4 && bi < 0; pass++) {
                             for (int k = 0; k < _allActorN; k++) {
                                 int team = _allActorTeam[k];
@@ -4513,11 +4546,11 @@ static int region_index_for(const planet_region *regs, int n, uint64_t addr)
                                 bool inRange = false;
 
                                 if (pass == 0 || pass == 1) {
-                                    if (!haveCamP)
-                                        continue;
-                                    float dx = _allActorPos[k * 3 + 0] - camP[0];
-                                    float dy = _allActorPos[k * 3 + 1] - camP[1];
-                                    float dz = _allActorPos[k * 3 + 2] - camP[2];
+                                    if (refX == 0.0f && refY == 0.0f && refZ == 0.0f)
+                                        continue;  /* no reference point */
+                                    float dx = _allActorPos[k * 3 + 0] - refX;
+                                    float dy = _allActorPos[k * 3 + 1] - refY;
+                                    float dz = _allActorPos[k * 3 + 2] - refZ;
                                     float ad2 = dx * dx + dy * dy + dz * dz;
                                     inRange = (ad2 <= 900.0f);  /* 30m squared */
                                     if (!inRange)

@@ -65,6 +65,7 @@ static bool diag_sleep_checked(double seconds)
     /* Round 48: all actor positions from team scan. */
     _allActorN = 0;
     _localTeam = 0;
+    _localPosValid = NO;
 
     /* Round 29 ESP state: the toggle and FOV index are UI-owned; the roots and
        camera live in the worker staging buffer until espCompleteScan publishes
