@@ -3895,6 +3895,34 @@ static int actor_team_at(mach_port_t task, uint64_t v, int off)
         }
     }
 
+    /* Round 50: populate _allActorPos from ALL actor bases (tv array, 61 actors)
+       by reading their view state. This feeds the bind-pose fallback. */
+    if (teamOff >= 0) {
+        for (int i = 0; i < tn && _allActorN < 512; i++) {
+            uint64_t v = tv[i];
+            uint64_t t = rd64(task, v + VIEW_OFF_FIELD);
+            if (!t)
+                continue;
+            float p[4];
+            if (mr_read(task, t + 0x120, p, sizeof(p)) != sizeof(p))
+                continue;
+            if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2]))
+                continue;
+
+            int val = actor_team_at(task, v, teamOff);
+            if (val < 0 || val > 2)
+                val = -1;
+
+            float rootY = p[1] - 1.6f;  /* feet level */
+
+            _allActorPos[_allActorN * 3 + 0] = p[0];
+            _allActorPos[_allActorN * 3 + 1] = rootY;
+            _allActorPos[_allActorN * 3 + 2] = p[2];
+            _allActorTeam[_allActorN] = val;
+            _allActorN++;
+        }
+    }
+
     int staged = 0;
     int friends = 0;
     int logged = 0;
