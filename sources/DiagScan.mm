@@ -974,10 +974,14 @@ static bool planet_trs_ok(const uint8_t *p, float *posOut)
    feet -> head. Round 31 correction: the four numbers are the ABSOLUTE y of the
    slots that follow the head, not gaps between them. Matched fingerprint:
    head y 0.940, then 0.121, 0.146, 0.138, 0.105. Returns the head slot index,
-   or -1 when the array is not a humanoid. */
+   or -1 when the array is not a humanoid.
+
+   Round 47: live skeletons have world-position roots (slot0 at map height).
+   Check RELATIVE to slot0 (root): head = root_y + 0.92..0.99, then
+   root_y + 0.121, 0.146, 0.138, 0.105. Works for both bind-pose and live. */
 static int human_sig_start(const uint8_t *raw, int rows)
 {
-    static const float kAbs[4] = { 0.121f, 0.146f, 0.138f, 0.105f };
+    static const float kRel[4] = { 0.121f, 0.146f, 0.138f, 0.105f };
 
     if (!raw || rows < PLANET_HUMAN_ROWS)
         return -1;
@@ -991,13 +995,17 @@ static int human_sig_start(const uint8_t *raw, int rows)
         y[k] = v;
     }
 
+    float rootY = y[0];  // slot0 = root (feet)
+
     for (int i = 0; i <= 3; i++) {
-        if (y[i] < PLANET_HUMAN_HEADLO || y[i] > PLANET_HUMAN_HEADHI)
+        float headRel = y[i] - rootY;
+        if (headRel < PLANET_HUMAN_HEADLO || headRel > PLANET_HUMAN_HEADHI)
             continue;
 
         int ok = 1;
         for (int k = 0; k < 4; k++) {
-            if (fabsf(y[i + 1 + k] - kAbs[k]) > 0.01f) {
+            float boneRel = y[i + 1 + k] - rootY;
+            if (fabsf(boneRel - kRel[k]) > 0.01f) {
                 ok = 0;
                 break;
             }
